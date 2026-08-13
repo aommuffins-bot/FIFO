@@ -27,8 +27,25 @@ import fifo_engine_v2 as fifo
 from db_engine import init_db, get_conn, products as products_tbl, stores as stores_tbl
 from sqlalchemy import text
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="A.O.M Cafe 進銷存 API", version="2.0.0",
                description="FIFO進銷存系統線上版（橋接自離線版fifo_engine.py）")
+
+# CORS設定：允許GitHub Pages存取
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://aommuffins-bot.github.io",
+        "http://localhost:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 其他路由定義...
 
 # 開發階段開放所有來源；正式上線請改為白名單（如僅允許前端網域）
 app.add_middleware(
