@@ -43,6 +43,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 def on_startup():
     init_db()
     auth.seed_default_admin()
+    from seed_100sku import seed as seed_products
+    seed_products()   # 自動匯入100 SKU，內部已用INSERT OR REPLACE，重複啟動不會重複新增
 
 
 # ------------------------------------------------------------------
