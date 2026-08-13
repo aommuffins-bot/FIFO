@@ -43,6 +43,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 def on_startup():
     init_db()
     auth.seed_default_admin()
+    from seed_100sku import seed as seed_products
+    seed_products()
 
 
 # ------------------------------------------------------------------
