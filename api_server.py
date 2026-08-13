@@ -32,7 +32,7 @@ app = FastAPI(title="A.O.M Cafe 進銷存 API", version="2.0.0",
 
 # 開發階段開放所有來源；正式上線請改為白名單（如僅允許前端網域）
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    CORSMiddleware, allow_origins=["https://aomcafefifo.jimdofree.com"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
