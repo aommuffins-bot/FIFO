@@ -30,7 +30,9 @@ app.add_middleware(
     allow_headers=["*"],  # 允許所有 HTTP 標頭
 )
 
-# ==================== 模擬資料庫 ====================
+# ==================== 模擬資料庫（請替換為您的實際資料庫）====================
+# 這裡使用簡化的記憶體儲存，實際部署時請替換為 SQLite/PostgreSQL
+
 # 使用者資料
 USERS_DB = {
     "admin": {
@@ -99,16 +101,16 @@ async def login(username: str = Query(...), password: str = Query(...)):
     user = USERS_DB.get(username)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
     password_hash = hashlib.sha256(password.encode()).hexdigest()
     if password_hash != user["password_hash"]:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
     access_token = create_access_token(
         data={"sub": user["username"], "role": user["role"]},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -122,7 +124,7 @@ async def get_inventory(store_id: int = Query(...), current_user: dict = Depends
     """取得即時庫存汇总（FIFO）"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     result = []
     for sku_no, item in INVENTORY_DB.items():
         result.append({
@@ -130,9 +132,9 @@ async def get_inventory(store_id: int = Query(...), current_user: dict = Depends
             "name": item["name"],
             "total_qty_g": item["total_qty_g"],
             "batch_count": len(item["batches"]),
-            "oldest_batch_age_days": 0 if not item["batches"] else 30
+            "oldest_batch_age_days": 0 if not item["batches"] else 30  # 簡化
         })
-    
+
     return result
 
 @app.get("/inventory/batches")
@@ -140,7 +142,7 @@ async def get_batches(store_id: int = Query(...), current_user: dict = Depends(g
     """取得所有批次明細（FIFO 順序）"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     result = []
     for sku_no, item in INVENTORY_DB.items():
         for batch in item["batches"]:
@@ -150,9 +152,9 @@ async def get_batches(store_id: int = Query(...), current_user: dict = Depends(g
                 "received_date": batch.get("received_date", ""),
                 "qty_g": batch.get("qty_g", 0),
                 "cost_per_100g": batch.get("cost_per_100g", 0),
-                "age_days": 30
+                "age_days": 30  # 簡化
             })
-    
+
     return result
 
 # ==================== 交易端點 ====================
@@ -167,7 +169,8 @@ async def receive_stock(
     """進貨登錄（FIFO 自動入帳）"""
     if sku_no not in INVENTORY_DB:
         raise HTTPException(status_code=400, detail="Invalid SKU")
-    
+
+    # 建立新批次
     new_batch = {
         "batch_id": f"BATCH-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
         "received_date": datetime.utcnow().isoformat(),
@@ -175,10 +178,11 @@ async def receive_stock(
         "cost_per_100g": cost_per_100g,
         "supplier": supplier
     }
-    
+
     INVENTORY_DB[sku_no]["batches"].append(new_batch)
     INVENTORY_DB[sku_no]["total_qty_g"] += qty_g
-    
+
+    # 記錄交易
     TRANSACTIONS_DB.append({
         "type": "receive",
         "sku_no": sku_no,
@@ -189,7 +193,7 @@ async def receive_stock(
         "timestamp": new_batch["received_date"],
         "store_id": current_user["store_id"]
     })
-    
+
     return {
         "status": "success",
         "message": f"進貨成功：{qty_g}g",
@@ -208,22 +212,24 @@ async def issue_stock(
     """出貨登錄（FIFO 自動扣帳）"""
     if sku_no not in INVENTORY_DB:
         raise HTTPException(status_code=400, detail="Invalid SKU")
-    
+
     item = INVENTORY_DB[sku_no]
     if item["total_qty_g"] < qty_g:
         raise HTTPException(
             status_code=400,
             detail=f"庫存不足：目前 {item['total_qty_g']}g，需要 {qty_g}g"
         )
-    
+
+    # FIFO 扣帳邏輯
     remaining_to_issue = qty_g
     batches_used = []
-    
+
     for batch in item["batches"]:
         if remaining_to_issue <= 0:
             break
-        
+
         if batch["qty_g"] <= remaining_to_issue:
+            # 整個批次用完
             batches_used.append({
                 "batch_id": batch["batch_id"],
                 "qty_used": batch["qty_g"]
@@ -231,15 +237,18 @@ async def issue_stock(
             remaining_to_issue -= batch["qty_g"]
             batch["qty_g"] = 0
         else:
+            # 部分使用
             batches_used.append({
                 "batch_id": batch["batch_id"],
                 "qty_used": remaining_to_issue
             })
             batch["qty_g"] -= remaining_to_issue
             remaining_to_issue = 0
-    
+
+    # 更新總庫存量
     item["total_qty_g"] -= qty_g
-    
+
+    # 記錄交易
     TRANSACTIONS_DB.append({
         "type": "issue",
         "sku_no": sku_no,
@@ -251,7 +260,7 @@ async def issue_stock(
         "store_id": current_user["store_id"],
         "batches_used": batches_used
     })
-    
+
     return {
         "status": "success",
         "message": f"出貨成功：{qty_g}g",
@@ -270,18 +279,18 @@ async def get_transactions(
     """查詢交易明細"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     result = TRANSACTIONS_DB.copy()
-    
+
     if type:
         result = [t for t in result if t["type"] == type]
-    
+
     if start_date:
         result = [t for t in result if t["timestamp"] >= start_date]
-    
+
     if end_date:
         result = [t for t in result if t["timestamp"] <= end_date]
-    
+
     return result
 
 # ==================== 報表端點 ====================
@@ -292,14 +301,14 @@ async def export_inventory_report(
 ):
     """匯出庫存報表（CSV 格式）"""
     from fastapi.responses import PlainTextResponse
-    
+
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    csv_content = "SKU,品名，庫存量 (g),批次數\\n"
+
+    csv_content = "SKU,品名，庫存量 (g),批次數\n"
     for sku_no, item in INVENTORY_DB.items():
-        csv_content += f"{sku_no},{item['name']},{item['total_qty_g']},{len(item['batches'])}\\n"
-    
+        csv_content += f"{sku_no},{item['name']},{item['total_qty_g']},{len(item['batches'])}\n"
+
     return PlainTextResponse(
         content=csv_content,
         media_type="text/csv",
@@ -313,24 +322,9 @@ async def export_transactions_report(
 ):
     """匯出交易報表（CSV 格式）"""
     from fastapi.responses import PlainTextResponse
-    
+
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    csv_content = "日期，類型，SKU,數量 (g),單價，總額，通路/供應商\\n"
-    for t in TRANSACTIONS_DB:
-        date = t["timestamp"].split("T")[0]
-        unit_price = t.get("cost_per_100g") or t.get("sell_price_ntd_per_100g")
-        counterparty = t.get("supplier") or t.get("channel")
-        csv_content += f"{date},{t['type']},{t['sku_no']},{t['qty_g']},{unit_price},{t['total_amount']},{counterparty}\\n"
-    
-    return PlainTextResponse(
-        content=csv_content,
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=transactions_report.csv"}
-    )
 
-# ==================== 主程式 ====================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    csv_content = "日期，類型，SKU,數量 (g),單價，總額，通路/供應商\n"
+    for t in TRANS
