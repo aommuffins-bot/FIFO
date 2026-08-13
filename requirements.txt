@@ -1,9 +1,0 @@
-# A.O.M Cafe 線上化橋接架構 — 相依套件清單
-# 離線版 cli_app.py 僅需Python標準庫，以下套件僅線上版(api_server.py)需要
-
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-sqlalchemy>=2.0.30
-psycopg2-binary>=2.9.9      # PostgreSQL驅動；若持續使用SQLite開發可省略
-pydantic>=2.7.0
-python-multipart>=0.0.9     # FastAPI表單/檔案上傳支援
