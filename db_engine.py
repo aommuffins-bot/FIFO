@@ -32,10 +32,6 @@ from sqlalchemy import (
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///aom_cafe_inventory.db")
 
-# 修正Render舊版postgres://前綴不相容問題
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
 # SQLite需要 check_same_thread=False 才能在多執行緒的FastAPI環境下使用；
 # PostgreSQL則不需要此參數，故依dialect動態決定connect_args。
 _connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
