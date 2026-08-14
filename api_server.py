@@ -1,7 +1,7 @@
 """
-api_server.py — A.O.M Cafe 進銷存 API v3（含 100 SKU 完整種子資料）
+api_server.py — A.O.M Cafe 進銷存 API v4（修正 Swagger UI OAuth2 認證）
 """
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Form
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
@@ -14,7 +14,7 @@ import os
 
 app = FastAPI(
     title="A.O.M Cafe 進銷存 API",
-    version="3.0.0",
+    version="4.0.0",
     description="FIFO 進銷存系統線上版（含 100 SKU 完整商品資料）",
     docs_url="/docs",
     openapi_url="/openapi.json",
@@ -57,7 +57,7 @@ PRODUCTS_DB = [
     {"sku_no": 14, "name": "剛果 Kivu 日曬", "continent": "非洲", "country": "剛果", "process": "日曬", "variety": "原生種", "flavor": "深果乾、可可豆、大地氣息", "rating": "★★★★☆"},
     {"sku_no": 15, "name": "葉門 Mokha 原生種", "continent": "非洲", "country": "葉門", "process": "日曬", "variety": "原生種混合", "flavor": "黑巧克力、野生莓果、複雜層次", "rating": "★★★★☆"},
     {"sku_no": 16, "name": "哥倫比亞 Huila Supremo", "continent": "中南美洲", "country": "哥倫比亞", "process": "水洗", "variety": "卡杜拉/蒂皮卡", "flavor": "焦糖、紅蘋果、溫和甜酸", "rating": "★★★★☆"},
-    {"sku_no": 17, "name": "哥倫比亞 Nariño 水洗", "continent": "中南美洲", "country": "哥倫比亞", "process": "水洗", "variety": "卡杜拉", "flavor": "柑橘花香、明亮果酸、優雅", "rating": "★★★★☆"},
+    {"sku_no": 17, "name": "哥倫比亞 Nari\u00f1o 水洗", "continent": "中南美洲", "country": "哥倫比亞", "process": "水洗", "variety": "卡杜拉", "flavor": "柑橘花香、明亮果酸、優雅", "rating": "★★★★☆"},
     {"sku_no": 18, "name": "哥倫比亞 厭氧日曬", "continent": "中南美洲", "country": "哥倫比亞", "process": "厭氧日曬", "variety": "卡杜拉", "flavor": "熱帶水果炸彈、濃烈發酵香", "rating": "★★★★☆"},
     {"sku_no": 19, "name": "哥倫比亞 El Paraiso 莊園", "continent": "中南美洲", "country": "哥倫比亞", "process": "厭氧蜜處理", "variety": "卡杜拉", "flavor": "菠蘿、荔枝、波本威士忌桶香", "rating": "★★★★☆"},
     {"sku_no": 20, "name": "哥倫比亞 Rosa 玫瑰日曬", "continent": "中南美洲", "country": "哥倫比亞", "process": "玫瑰日曬", "variety": "卡杜拉", "flavor": "玫瑰花茶、草莓、甜感優雅", "rating": "★★★★☆"},
@@ -235,14 +235,26 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.get("/")
 async def root():
-    return {"message": "A.O.M Cafe 進銷存 API v3.0.0", "status": "online", "total_sku": len(PRODUCTS_DB)}
+    return {"message": "A.O.M Cafe 進銷存 API v4.0.0", "status": "online", "total_sku": len(PRODUCTS_DB)}
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 @app.post("/auth/login", response_model=Token, summary="使用者登入")
-async def login_for_access_token(username: str = Query(...), password: str = Query(...)):
+async def login_for_access_token(
+    username: Optional[str] = Query(None, description="使用者帳號（Query 參數模式）"),
+    password: Optional[str] = Query(None, description="使用者密碼（Query 參數模式）"),
+    form_username: Optional[str] = Form(None, alias="username", description="使用者帳號（表單模式，供 Swagger UI 使用）"),
+    form_password: Optional[str] = Form(None, alias="password", description="使用者密碼（表單模式，供 Swagger UI 使用）")
+):
+    # 優先使用表單資料（Swagger UI OAuth2 流程）
+    if form_username and form_password:
+        username = form_username
+        password = form_password
+    elif not username or not password:
+        raise HTTPException(status_code=400, detail="請提供 username 和 password（Query 參數或表單）", headers={"WWW-Authenticate": "Bearer"})
+    
     user = USERS_DB.get(username)
     if not user or not user["is_active"]:
         raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Bearer"})
@@ -389,7 +401,7 @@ async def get_transactions(store_id: int = Query(...), start_date: Optional[str]
 async def export_inventory_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    csv_content = "SKU,品名,庫存量(g),批次數\n"
+    csv_content = "SKU,品名，庫存量(g),批次數\n"
     for sku_no, item in INVENTORY_DB.items():
         csv_content += f"{sku_no},{item['name']},{item['total_qty_g']},{len(item['batches'])}\n"
     return PlainTextResponse(content=csv_content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=inventory_report.csv"})
@@ -398,7 +410,7 @@ async def export_inventory_report(store_id: int = Query(...), current_user: dict
 async def export_transactions_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    csv_content = "日期,類型,SKU,數量(g),單價,總額,通路\n"
+    csv_content = "日期，類型，SKU,數量(g),單價，總額，通路\n"
     for t in TRANSACTIONS_DB:
         csv_content += f"{t['txn_date']},{t['txn_type']},{t['sku_no']},{t['qty_g']},{t['unit_price_ntd_per_g']},{t['total_amount_ntd']},{t['channel']}\n"
     return PlainTextResponse(content=csv_content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=transactions_report.csv"})
