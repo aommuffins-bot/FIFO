@@ -1,5 +1,6 @@
 """
-api_server.py — A.O.M Cafe 進銷存 API（簡化整合版，修正密碼雜湊）
+api_server.py — A.O.M Cafe 進銷存 API（最終修正版）
+整合所有修正，確保能正常運作
 """
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.security.http import HTTPBearer
@@ -12,7 +13,7 @@ import jwt
 import hashlib
 import os
 import secrets
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, Float, String, Text, DateTime, ForeignKey, CheckConstraint, text
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, Float, String, Text, DateTime, ForeignKey, text
 from contextlib import contextmanager
 
 # ==================== 資料庫設定 ====================
@@ -21,7 +22,7 @@ _connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite"
 _engine = create_engine(DATABASE_URL, connect_args=_connect_args, future=True)
 metadata = MetaData()
 
-# 資料表定義（簡化，只保留必要欄位）
+# 資料表定義（簡化）
 stores = Table("stores", metadata,
     Column("store_id", Integer, primary_key=True, autoincrement=True),
     Column("store_name", String(100), nullable=False),
@@ -81,7 +82,7 @@ txn_allocations = Table("txn_allocations", metadata,
 )
 
 def hash_password(password: str, salt: str) -> str:
-    """使用 PBKDF2-SHA256 雜湊密碼（與 auth.py 一致）"""
+    """使用 PBKDF2-SHA256 雜湊密碼"""
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
 
 def init_db():
@@ -302,9 +303,9 @@ async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_cu
             batch_id = result.lastrowid if hasattr(result, "lastrowid") else result.inserted_primary_key[0]
             conn.execute(
                 text("""INSERT INTO transactions (sku_no, store_id, txn_type, txn_date, qty_g, unit_price_ntd_per_g,
-                        total_amount_ntd, channel, created_by) VALUES (:sku, :store, 'IN', :tdate, :qty, :price, :amt, '進貨', :uid)"""),
+                        total_amount_ntd, channel) VALUES (:sku, :store, 'IN', :tdate, :qty, :price, :amt, '進貨')"""),
                 {"sku": req.sku_no, "store": current_user["store_id"], "tdate": receive_date, "qty": req.qty_g,
-                 "price": req.cost_per_100g / 100, "amt": req.qty_g * req.cost_per_100g / 100, "uid": current_user.get("user_id")}
+                 "price": req.cost_per_100g / 100, "amt": req.qty_g * req.cost_per_100g / 100}
             )
         return {"status": "success", "message": f"進貨成功：{req.qty_g}g", "new_total_qty_g": req.qty_g}
     except Exception as e:
@@ -338,9 +339,9 @@ async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_curren
             total_amount = req.qty_g * req.sell_price_ntd_per_100g / 100
             result = conn.execute(
                 text("""INSERT INTO transactions (sku_no, store_id, txn_type, txn_date, qty_g, unit_price_ntd_per_g,
-                        total_amount_ntd, channel, created_by) VALUES (:sku, :store, 'OUT', :tdate, :qty, :price, :amt, :channel, :uid)"""),
+                        total_amount_ntd, channel) VALUES (:sku, :store, 'OUT', :tdate, :qty, :price, :amt, :channel)"""),
                 {"sku": req.sku_no, "store": current_user["store_id"], "tdate": issue_date, "qty": req.qty_g,
-                 "price": req.sell_price_ntd_per_100g / 100, "amt": total_amount, "channel": req.channel, "uid": current_user.get("user_id")}
+                 "price": req.sell_price_ntd_per_100g / 100, "amt": total_amount, "channel": req.channel}
             )
             txn_id = result.lastrowid if hasattr(result, "lastrowid") else result.inserted_primary_key[0]
             for a in batches_used:
