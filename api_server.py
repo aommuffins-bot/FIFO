@@ -1,6 +1,5 @@
 """
-api_server.py — A.O.M Cafe 進銷存 API（簡化整合版）
-所有功能整合在單一檔案，確保可預測性和易於部署
+api_server.py — A.O.M Cafe 進銷存 API（簡化整合版，修正密碼雜湊）
 """
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.security.http import HTTPBearer
@@ -12,6 +11,7 @@ from typing import Optional, List
 import jwt
 import hashlib
 import os
+import secrets
 from sqlalchemy import create_engine, MetaData, Table, Column, Integer, Float, String, Text, DateTime, ForeignKey, CheckConstraint, text
 from contextlib import contextmanager
 
@@ -21,11 +21,10 @@ _connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite"
 _engine = create_engine(DATABASE_URL, connect_args=_connect_args, future=True)
 metadata = MetaData()
 
-# 資料表定義
+# 資料表定義（簡化，只保留必要欄位）
 stores = Table("stores", metadata,
     Column("store_id", Integer, primary_key=True, autoincrement=True),
     Column("store_name", String(100), nullable=False),
-    Column("address", String(200)),
     Column("is_active", Integer, default=1),
 )
 
@@ -37,29 +36,11 @@ users = Table("users", metadata,
     Column("role", String(20), nullable=False),
     Column("store_id", Integer, ForeignKey("stores.store_id"), nullable=True),
     Column("is_active", Integer, default=1),
-    Column("created_at", DateTime, server_default=text("CURRENT_TIMESTAMP")),
-    CheckConstraint("role IN ('admin','staff')", name="ck_users_role"),
 )
 
 products = Table("products", metadata,
     Column("sku_no", Integer, primary_key=True),
-    Column("continent", String(20), nullable=False),
-    Column("country", String(30), nullable=False),
     Column("name", String(100), nullable=False),
-    Column("process", String(30)),
-    Column("variety", String(50)),
-    Column("flavor", Text),
-    Column("rating", String(10)),
-    Column("strategy", String(20)),
-    Column("batch_hint", String(30)),
-    Column("cost_range_raw", String(50)),
-    Column("cost_ntd_100g_raw", String(50)),
-    Column("retail_ntd_100g_raw", String(50)),
-    Column("margin_pct_raw", String(20)),
-    Column("notes", Text),
-    Column("season", String(30)),
-    Column("importer", String(50)),
-    Column("shelf_life_months", Integer, default=9),
     Column("is_active", Integer, default=1),
 )
 
@@ -75,9 +56,6 @@ batches = Table("batches", metadata,
     Column("origin", String(100)),
     Column("flavor", Text),
     Column("process", String(30)),
-    Column("roast_date", String(10)),
-    Column("lot_ref", String(100)),
-    Column("created_by", Integer, ForeignKey("users.user_id"), nullable=True),
     Column("created_at", DateTime, server_default=text("CURRENT_TIMESTAMP")),
 )
 
@@ -90,13 +68,8 @@ transactions = Table("transactions", metadata,
     Column("qty_g", Float, nullable=False),
     Column("unit_price_ntd_per_g", Float),
     Column("total_amount_ntd", Float),
-    Column("total_cogs_ntd", Float),
-    Column("gross_profit_ntd", Float),
     Column("channel", String(20)),
-    Column("reference", String(100)),
-    Column("created_by", Integer, ForeignKey("users.user_id"), nullable=True),
     Column("created_at", DateTime, server_default=text("CURRENT_TIMESTAMP")),
-    CheckConstraint("txn_type IN ('IN','OUT','ADJUST')", name="ck_txn_type"),
 )
 
 txn_allocations = Table("txn_allocations", metadata,
@@ -107,6 +80,10 @@ txn_allocations = Table("txn_allocations", metadata,
     Column("unit_cost_ntd_per_g", Float, nullable=False),
 )
 
+def hash_password(password: str, salt: str) -> str:
+    """使用 PBKDF2-SHA256 雜湊密碼（與 auth.py 一致）"""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+
 def init_db():
     """初始化資料庫：建立所有資料表和預設資料"""
     metadata.create_all(_engine)
@@ -114,36 +91,35 @@ def init_db():
         # 建立預設門店
         exists = conn.execute(text("SELECT COUNT(*) FROM stores")).scalar()
         if not exists:
-            conn.execute(stores.insert().values(store_id=1, store_name="A.O.M Cafe 台中旗艦店", address="台中市", is_active=1))
+            conn.execute(stores.insert().values(store_id=1, store_name="A.O.M Cafe 台中旗艦店", is_active=1))
         
-        # 建立預設帳號（admin / admin123）
+        # 建立預設帳號（使用 PBKDF2 雜湊）
         exists = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
         if not exists:
-            salt = "default_salt_12345"
-            pw_hash = hashlib.sha256(("admin123" + salt).encode()).hexdigest()
-            conn.execute(users.insert().values(username="admin", password_hash=pw_hash, password_salt=salt, role="admin", store_id=1, is_active=1))
+            # admin / admin123
+            salt1 = secrets.token_hex(32)
+            pw_hash1 = hash_password("admin123", salt1)
+            conn.execute(users.insert().values(username="admin", password_hash=pw_hash1, password_salt=salt1, role="admin", store_id=1, is_active=1))
             
-            salt2 = "default_salt_67890"
-            pw_hash2 = hashlib.sha256(("Dc20220111" + salt2).encode()).hexdigest()
+            # aom_founder / Dc20220111
+            salt2 = secrets.token_hex(32)
+            pw_hash2 = hash_password("Dc20220111", salt2)
             conn.execute(users.insert().values(username="aom_founder", password_hash=pw_hash2, password_salt=salt2, role="admin", store_id=1, is_active=1))
+            
+            print("已建立預設帳號：admin/admin123 和 aom_founder/Dc20220111")
         
-        # 建立預設商品（10 SKU）
+        # 建立預設商品
         exists = conn.execute(text("SELECT COUNT(*) FROM products")).scalar()
         if not exists:
             default_products = [
-                (1, '非洲', '衣索比亞', '耶加雪菲 Yirgacheffe G1', '水洗', '阿拉比卡', '花香、茉莉、柑橘', '★★★★☆', '核心必備', '', '', '', '', '', '耶加雪菲 G1', '全年', '圓石', 9, 1),
-                (2, '非洲', '衣索比亞', '耶加雪菲 日曬 G1', '日曬', '阿拉比卡', '藍莓、熱帶水果', '★★★★☆', '核心必備', '', '', '', '', '', '耶加雪菲 日曬 G1', '全年', '守成', 9, 1),
-                (3, '非洲', '肯亞', '肯亞 AA 水洗', '水洗', 'SL28/SL34', '黑醋栗、番茄', '★★★★☆', '核心必備', '', '', '', '', '', '肯亞 AA', '全年', '圓石', 9, 1),
-                (4, '中南美洲', '哥倫比亞', '哥倫比亞 Huila Supremo', '水洗', '卡杜拉', '焦糖、紅蘋果', '★★★★☆', '核心必備', '', '', '', '', '', 'Huila Supremo', '全年', '豐潤', 9, 1),
-                (5, '亞洲', '印尼', '蘇門達臘 Mandheling G1', '濕刨', '卡杜拉', '草本、香料', '★★★★☆', '核心必備', '', '', '', '', '', 'Mandheling G1', '全年', '豐潤', 9, 1),
+                (1, '耶加雪菲 Yirgacheffe G1'),
+                (2, '耶加雪菲 日曬 G1'),
+                (3, '肯亞 AA 水洗'),
+                (4, '哥倫比亞 Huila Supremo'),
+                (5, '蘇門達臘 Mandheling G1'),
             ]
-            for p in default_products:
-                conn.execute(products.insert().values(
-                    sku_no=p[0], continent=p[1], country=p[2], name=p[3], process=p[4], variety=p[5],
-                    flavor=p[6], rating=p[7], strategy=p[8], batch_hint=p[9], cost_range_raw=p[10],
-                    cost_ntd_100g_raw=p[11], retail_ntd_100g_raw=p[12], margin_pct_raw=p[13],
-                    notes=p[14], season=p[15], importer=p[16], shelf_life_months=p[17], is_active=p[18]
-                ))
+            for sku_no, name in default_products:
+                conn.execute(products.insert().values(sku_no=sku_no, name=name, is_active=1))
 
 @contextmanager
 def get_conn():
@@ -187,7 +163,6 @@ class ReceiveRequest(BaseModel):
     origin: Optional[str] = ""
     flavor: Optional[str] = ""
     process: Optional[str] = ""
-    roast_date: Optional[str] = ""
 
 class IssueRequest(BaseModel):
     sku_no: int
@@ -200,7 +175,6 @@ class InventoryItem(BaseModel):
     name: str
     total_qty_g: float
     batch_count: int
-    oldest_batch_age_days: Optional[int] = None
 
 class BatchItem(BaseModel):
     sku_no: int
@@ -212,7 +186,6 @@ class BatchItem(BaseModel):
     origin: str
     flavor: str
     process: str
-    age_days: int
 
 class TransactionItem(BaseModel):
     txn_id: int
@@ -279,7 +252,8 @@ async def login(username: str = Query(...), password: str = Query(...)):
         ).mappings().first()
         if not user or not user["is_active"]:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        pw_hash = hashlib.sha256((password + user["password_salt"]).encode()).hexdigest()
+        # 使用 PBKDF2 驗證密碼
+        pw_hash = hash_password(password, user["password_salt"])
         if pw_hash != user["password_hash"]:
             raise HTTPException(status_code=401, detail="Invalid credentials")
         access_token = create_access_token({"sub": user["username"], "role": user["role"], "store_id": user["store_id"]})
@@ -296,7 +270,7 @@ async def get_inventory(store_id: int = Query(...), current_user: dict = Depends
             LEFT JOIN batches b ON p.sku_no = b.sku_no AND b.store_id = :store_id
             WHERE p.is_active = 1 GROUP BY p.sku_no, p.name ORDER BY p.sku_no
         """), {"store_id": store_id}).mappings().all()
-        return [{"sku_no": r["sku_no"], "name": r["name"], "total_qty_g": r["total_qty_g"], "batch_count": r["batch_count"], "oldest_batch_age_days": 30} for r in result]
+        return [{"sku_no": r["sku_no"], "name": r["name"], "total_qty_g": r["total_qty_g"], "batch_count": r["batch_count"]} for r in result]
 
 @app.get("/inventory/batches", response_model=List[BatchItem])
 async def get_batches(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
@@ -305,34 +279,32 @@ async def get_batches(store_id: int = Query(...), current_user: dict = Depends(g
     with get_conn() as conn:
         result = conn.execute(text("""
             SELECT b.batch_id, b.sku_no, b.receive_date, b.qty_remaining_g as qty_g, b.unit_cost_ntd_per_g as cost_per_100g,
-                   b.supplier, b.origin, b.flavor, b.process, p.name
-            FROM batches b JOIN products p ON b.sku_no = p.sku_no
+                   b.supplier, b.origin, b.flavor, b.process
+            FROM batches b
             WHERE b.store_id = :store_id AND b.qty_remaining_g > 0 ORDER BY b.receive_date ASC
         """), {"store_id": store_id}).mappings().all()
         return [{"sku_no": r["sku_no"], "batch_id": r["batch_id"], "receive_date": r["receive_date"], "qty_g": r["qty_g"],
                  "cost_per_100g": r["cost_per_100g"], "supplier": r["supplier"] or "", "origin": r["origin"] or "",
-                 "flavor": r["flavor"] or "", "process": r["process"] or "", "age_days": 30} for r in result]
+                 "flavor": r["flavor"] or "", "process": r["process"] or ""} for r in result]
 
 @app.post("/transactions/receive", response_model=SuccessResponse)
 async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_current_user)):
     try:
-        receive_date = req.roast_date or datetime.utcnow().strftime("%Y-%m-%d")
+        receive_date = datetime.utcnow().strftime("%Y-%m-%d")
         with get_conn() as conn:
             result = conn.execute(
                 text("""INSERT INTO batches (sku_no, store_id, receive_date, qty_received_g, qty_remaining_g,
-                        unit_cost_ntd_per_g, supplier, origin, flavor, process, roast_date, created_by)
-                        VALUES (:sku, :store, :rdate, :qty, :qty, :cost, :sup, :origin, :flavor, :process, :roast, :uid)"""),
+                        unit_cost_ntd_per_g, supplier, origin, flavor, process)
+                        VALUES (:sku, :store, :rdate, :qty, :qty, :cost, :sup, :origin, :flavor, :process)"""),
                 {"sku": req.sku_no, "store": current_user["store_id"], "rdate": receive_date, "qty": req.qty_g,
-                 "cost": req.cost_per_100g / 100, "sup": req.supplier, "origin": req.origin, "flavor": req.flavor,
-                 "process": req.process, "roast": req.roast_date, "uid": current_user.get("user_id")}
+                 "cost": req.cost_per_100g / 100, "sup": req.supplier, "origin": req.origin, "flavor": req.flavor, "process": req.process}
             )
             batch_id = result.lastrowid if hasattr(result, "lastrowid") else result.inserted_primary_key[0]
             conn.execute(
                 text("""INSERT INTO transactions (sku_no, store_id, txn_type, txn_date, qty_g, unit_price_ntd_per_g,
-                        total_amount_ntd, reference, created_by) VALUES (:sku, :store, 'IN', :tdate, :qty, :price, :amt, :ref, :uid)"""),
+                        total_amount_ntd, channel, created_by) VALUES (:sku, :store, 'IN', :tdate, :qty, :price, :amt, '進貨', :uid)"""),
                 {"sku": req.sku_no, "store": current_user["store_id"], "tdate": receive_date, "qty": req.qty_g,
-                 "price": req.cost_per_100g / 100, "amt": req.qty_g * req.cost_per_100g / 100,
-                 "ref": f"批次#{batch_id}", "uid": current_user.get("user_id")}
+                 "price": req.cost_per_100g / 100, "amt": req.qty_g * req.cost_per_100g / 100, "uid": current_user.get("user_id")}
             )
         return {"status": "success", "message": f"進貨成功：{req.qty_g}g", "new_total_qty_g": req.qty_g}
     except Exception as e:
@@ -364,21 +336,18 @@ async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_curren
                 total_cogs += take * b["unit_cost_ntd_per_g"]
                 remaining -= take
             total_amount = req.qty_g * req.sell_price_ntd_per_100g / 100
-            gross_profit = total_amount - total_cogs
             result = conn.execute(
                 text("""INSERT INTO transactions (sku_no, store_id, txn_type, txn_date, qty_g, unit_price_ntd_per_g,
-                        total_amount_ntd, total_cogs_ntd, gross_profit_ntd, channel, created_by)
-                        VALUES (:sku, :store, 'OUT', :tdate, :qty, :price, :amt, :cogs, :profit, :channel, :uid)"""),
+                        total_amount_ntd, channel, created_by) VALUES (:sku, :store, 'OUT', :tdate, :qty, :price, :amt, :channel, :uid)"""),
                 {"sku": req.sku_no, "store": current_user["store_id"], "tdate": issue_date, "qty": req.qty_g,
-                 "price": req.sell_price_ntd_per_100g / 100, "amt": total_amount, "cogs": total_cogs,
-                 "profit": gross_profit, "channel": req.channel, "uid": current_user.get("user_id")}
+                 "price": req.sell_price_ntd_per_100g / 100, "amt": total_amount, "channel": req.channel, "uid": current_user.get("user_id")}
             )
             txn_id = result.lastrowid if hasattr(result, "lastrowid") else result.inserted_primary_key[0]
             for a in batches_used:
                 conn.execute(
                     text("""INSERT INTO txn_allocations (txn_id, batch_id, qty_g, unit_cost_ntd_per_g)
                             VALUES (:txn, :bid, :qty, :cost)"""),
-                    {"txn": txn_id, "bid": a["batch_id"], "qty": a["qty_used"], "cost": total_cogs / req.qty_g}
+                    {"txn": txn_id, "bid": a["batch_id"], "qty": a["qty_used"], "cost": total_cogs / req.qty_g if req.qty_g > 0 else 0}
                 )
         return {"status": "success", "message": f"出貨成功：{req.qty_g}g", "batches_used": batches_used, "new_total_qty_g": available - req.qty_g}
     except HTTPException:
