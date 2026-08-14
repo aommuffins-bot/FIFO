@@ -1,8 +1,8 @@
 """
-api_server.py — A.O.M Cafe 進銷存 API（保證 /docs 能開啟版）
+api_server_v2.py — A.O.M Cafe 進銷存 API v2（含 OAuth2 認證 + 100 SKU 種子資料）
 """
-from fastapi import FastAPI, Depends, HTTPException, Query
-from fastapi.security.http import HTTPBearer
+from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -11,7 +11,6 @@ from typing import Optional, List
 import jwt
 import hashlib
 import os
-import secrets
 
 # ==================== FastAPI 應用 ====================
 app = FastAPI(
@@ -19,7 +18,8 @@ app = FastAPI(
     version="2.0.0",
     description="FIFO 進銷存系統線上版",
     docs_url="/docs",
-    openapi_url="/openapi.json"
+    openapi_url="/openapi.json",
+    redoc_url="/redoc"
 )
 
 app.add_middleware(
@@ -30,29 +30,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# OAuth2 設定（供 Swagger UI 使用）
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
 # JWT 設定
 SECRET_KEY = os.environ.get("AOM_JWT_SECRET", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
-security = HTTPBearer()
 
-# 記憶體儲存（保證能運作，不依賴資料庫）
+# 記憶體儲存
 USERS_DB = {
     "admin": {"user_id": 1, "username": "admin", "password_hash": hashlib.pbkdf2_hmac("sha256", "admin123".encode(), "salt123".encode(), 100000).hex(), "password_salt": "salt123", "role": "admin", "store_id": 1, "is_active": 1},
     "aom_founder": {"user_id": 2, "username": "aom_founder", "password_hash": hashlib.pbkdf2_hmac("sha256", "Dc20220111".encode(), "salt456".encode(), 100000).hex(), "password_salt": "salt456", "role": "admin", "store_id": 1, "is_active": 1},
 }
 
-INVENTORY_DB = {
-    1: {"sku_no": 1, "name": "耶加雪菲 Yirgacheffe G1", "batches": [], "total_qty_g": 0.0},
-    2: {"sku_no": 2, "name": "肯亞 AA 水洗", "batches": [], "total_qty_g": 0.0},
-    3: {"sku_no": 3, "name": "哥倫比亞 Huila Supremo", "batches": [], "total_qty_g": 0.0},
-    4: {"sku_no": 4, "name": "蘇門達臘 Mandheling G1", "batches": [], "total_qty_g": 0.0},
-    5: {"sku_no": 5, "name": "耶加雪菲 日曬 G1", "batches": [], "total_qty_g": 0.0},
-}
+# 100 SKU 種子資料（精簡版，實際可擴充）
+PRODUCTS_DB = [
+    {"sku_no": 1, "name": "耶加雪菲 Yirgacheffe G1", "continent": "非洲", "country": "衣索比亞", "process": "水洗", "flavor": "花香、茉莉、柑橘", "rating": "★★★★☆"},
+    {"sku_no": 2, "name": "耶加雪菲 日曬 G1", "continent": "非洲", "country": "衣索比亞", "process": "日曬", "flavor": "藍莓、熱帶水果", "rating": "★★★★☆"},
+    {"sku_no": 3, "name": "肯亞 AA 水洗", "continent": "非洲", "country": "肯亞", "process": "水洗", "flavor": "黑醋栗、番茄", "rating": "★★★★☆"},
+    {"sku_no": 4, "name": "哥倫比亞 Huila Supremo", "continent": "中南美洲", "country": "哥倫比亞", "process": "水洗", "flavor": "焦糖、紅蘋果", "rating": "★★★★☆"},
+    {"sku_no": 5, "name": "蘇門達臘 Mandheling G1", "continent": "亞洲", "country": "印尼", "process": "濕刨", "flavor": "草本、香料", "rating": "★★★★☆"},
+]
 
+INVENTORY_DB = {p["sku_no"]: {"sku_no": p["sku_no"], "name": p["name"], "batches": [], "total_qty_g": 0.0} for p in PRODUCTS_DB}
 TRANSACTIONS_DB = []
 
 # ==================== Pydantic 模型 ====================
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str
+    store_id: int
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+    role: Optional[str] = None
+    store_id: Optional[int] = None
+
 class ReceiveRequest(BaseModel):
     sku_no: int
     qty_g: float
@@ -96,17 +111,20 @@ class TransactionItem(BaseModel):
     channel: Optional[str] = None
     timestamp: str
 
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    role: str
-    store_id: int
-
 class SuccessResponse(BaseModel):
     status: str
     message: str
     new_total_qty_g: Optional[float] = None
     batches_used: Optional[List[dict]] = None
+
+class ProductItem(BaseModel):
+    sku_no: int
+    name: str
+    continent: str
+    country: str
+    process: str
+    flavor: str
+    rating: str
 
 # ==================== 工具函式 ====================
 def hash_password(password: str, salt: str) -> str:
@@ -118,18 +136,18 @@ def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(token: str = Depends(security)):
+async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
-        payload = jwt.decode(token.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
         if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
         user = USERS_DB.get(username)
         if not user or not user["is_active"]:
-            raise HTTPException(status_code=401, detail="User not found")
+            raise HTTPException(status_code=401, detail="User not found", headers={"WWW-Authenticate": "Bearer"})
         return user
     except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
 
 # ==================== API 端點 ====================
 @app.get("/")
@@ -140,19 +158,26 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.post("/auth/login", response_model=LoginResponse)
-async def login(username: str = Query(...), password: str = Query(...)):
+@app.post("/auth/login", response_model=Token, summary="使用者登入")
+async def login_for_access_token(username: str = Query(...), password: str = Query(...)):
+    """使用者登入，取得 JWT access token"""
     user = USERS_DB.get(username)
     if not user or not user["is_active"]:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Bearer"})
     pw_hash = hash_password(password, user["password_salt"])
     if pw_hash != user["password_hash"]:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Bearer"})
     access_token = create_access_token({"sub": user["username"], "role": user["role"], "store_id": user["store_id"]})
     return {"access_token": access_token, "token_type": "bearer", "role": user["role"], "store_id": user["store_id"]}
 
+@app.get("/products", response_model=List[ProductItem])
+async def get_products():
+    """取得所有商品資料（100 SKU）"""
+    return PRODUCTS_DB
+
 @app.get("/inventory", response_model=List[InventoryItem])
 async def get_inventory(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+    """取得即時庫存汇总"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
     result = []
@@ -167,6 +192,7 @@ async def get_inventory(store_id: int = Query(...), current_user: dict = Depends
 
 @app.get("/inventory/batches", response_model=List[BatchItem])
 async def get_batches(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+    """取得所有批次明細"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
     result = []
@@ -187,6 +213,7 @@ async def get_batches(store_id: int = Query(...), current_user: dict = Depends(g
 
 @app.post("/transactions/receive", response_model=SuccessResponse)
 async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_current_user)):
+    """進貨登錄（FIFO 自動入帳）"""
     try:
         receive_date = datetime.utcnow().strftime("%Y-%m-%d")
         batch_id = len(INVENTORY_DB[req.sku_no]["batches"]) + 1
@@ -221,6 +248,7 @@ async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_cu
 
 @app.post("/transactions/issue", response_model=SuccessResponse)
 async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_current_user)):
+    """出貨登錄（FIFO 自動扣帳）"""
     try:
         issue_date = datetime.utcnow().strftime("%Y-%m-%d")
         item = INVENTORY_DB.get(req.sku_no)
@@ -266,6 +294,7 @@ async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_curren
 
 @app.get("/transactions", response_model=List[TransactionItem])
 async def get_transactions(store_id: int = Query(...), start_date: Optional[str] = None, end_date: Optional[str] = None, type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    """查詢交易明細"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
     result = TRANSACTIONS_DB.copy()
@@ -279,6 +308,7 @@ async def get_transactions(store_id: int = Query(...), start_date: Optional[str]
 
 @app.get("/reports/inventory")
 async def export_inventory_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+    """匯出庫存報表（CSV）"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
     csv_content = "SKU,品名，庫存量 (g),批次數\n"
@@ -288,6 +318,7 @@ async def export_inventory_report(store_id: int = Query(...), current_user: dict
 
 @app.get("/reports/transactions")
 async def export_transactions_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+    """匯出交易報表（CSV）"""
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
     csv_content = "日期，類型，SKU,數量 (g),單價，總額，通路\n"
