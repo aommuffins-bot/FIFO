@@ -129,3 +129,5 @@ def seed_known_accounts():
         create_user("admin", "admin123", role="admin", store_id=1)
     if not user_exists("aom_founder"):
         create_user("aom_founder", "Dc20220111", role="admin", store_id=1)
+    if not user_exists("aom_staff"):
+        create_user("aom_staff", "aomstaff008", role="staff", store_id=1)
