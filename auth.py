@@ -9,12 +9,10 @@ auth.py -- 權限管理層：使用者驗證、角色控制
 - 密碼雜湊：使用 Python 標準庫 hashlib.pbkdf2_hmac
 - Token 機制：輕量級自製 JWT(HS256)，僅依賴標準庫，無需額外安裝 python-jose
 
-v2 修正紀錄：
-- seed_known_accounts() 改為「強制校正密碼」邏輯：
-  系統內建帳號（admin/aom_founder/aom_staff）若已存在於資料庫，
-  但密碼與程式碼中指定的已知密碼不符（例如資料庫殘留舊版本的密碼），
-  會自動更新為程式碼中指定的密碼，確保每次部署後這幾組帳密必定可登入。
-  （此設計僅適用於系統固定帳號，不影響一般使用者未來自訂密碼的彈性）
+更新紀錄：
+- v2：seed_known_accounts() 改為「強制校正密碼」邏輯：系統內建帳號
+  若已存在於資料庫但密碼與程式碼中指定的不符，會自動更新為指定密碼。
+- v3：admin 帳號密碼由 admin123 更新為 aomcafe2014（不再於前端公開顯示預設密碼）。
 """
 
 import os
@@ -142,7 +140,7 @@ def user_exists(username: str) -> bool:
 
 # 系統內建固定帳號（帳號、密碼、角色）：每次啟動皆會強制校正密碼
 KNOWN_ACCOUNTS = [
-    ("admin", "admin123", "admin"),
+    ("admin", "aomcafe2014", "admin"),
     ("aom_founder", "Dc20220111", "admin"),
     ("aom_staff", "aomstaff008", "staff"),
 ]
