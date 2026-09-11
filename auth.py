@@ -3,7 +3,7 @@ auth.py -- 權限管理層：使用者驗證、角色控制
 ------------------------------------------------------------------------
 角色設計：
 - admin（管理者）：可進貨、可出貨、可查看完整損益報表
-- staff（店員）：僅可執行出貨
+- staff（店員）：僅可執行出貨，無法進貨或查看成本/毛利數據
 
 實作說明：
 - 密碼雜湊：使用 Python 標準庫 hashlib.pbkdf2_hmac
@@ -122,8 +122,9 @@ def user_exists(username: str) -> bool:
 
 def seed_known_accounts():
     """
-    確保既有前端使用的兩個帳號存在於真實資料庫中（若不存在才建立），
-    密碼沿用先前記憶體版 API 的預設帳密，前端登入流程不需變動。
+    確保系統預設帳號存在於真實資料庫中（若不存在才建立）。
+    - admin / aom_founder：管理者角色，可進貨/出貨/查看完整報表
+    - aom_staff：店員角色，僅可執行出貨，無法進貨或查看成本/毛利數據
     """
     if not user_exists("admin"):
         create_user("admin", "admin123", role="admin", store_id=1)

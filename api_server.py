@@ -1,13 +1,16 @@
 """
-api_server.py -- A.O.M Cafe 進銷存 API v7
+api_server.py -- A.O.M Cafe 進銷存 API v8
 ------------------------------------------------------------------------
-本版本改為真正串接資料庫（db_engine.py + fifo_engine_v2.py + auth.py），
-取代先前的記憶體字典版本：
-1. 進貨 / 出貨 / 庫存查詢皆呼叫 fifo_engine_v2.py 的 FIFO 引擎，寫入真實資料庫
-2. 登入機制改回 auth.py 的 PBKDF2 + 自製 JWT（HS256）
-3. 啟動時呼叫 seed_135sku.seed() 寫入 135 筆商品主檔，並確保既有帳號存在
-4. 若資料庫初始化失敗（例如缺少相依檔案），服務仍會啟動，但需要修正後才能使用
-   進貨/出貨/庫存等資料庫功能（/health 與 /docs 不受影響）
+本版本基於 v7（真實資料庫串接版），新增角色權限限制：
+- admin（管理者）：可進貨、可出貨、可查看完整報表
+- staff（店員）：僅可執行出貨，進貨端點回傳 403 Forbidden
+
+其餘架構與 v7 相同：
+1. 進貨/出貨/庫存查詢皆呼叫 fifo_engine_v2.py 的 FIFO 引擎，寫入真實資料庫
+2. 登入機制使用 auth.py 的 PBKDF2 + 自製 JWT（HS256）
+3. 啟動時呼叫 seed_135sku.seed() 寫入 135 筆商品主檔，並確保帳號存在
+   （admin / aom_founder：管理者；aom_staff：店員）
+4. 若資料庫初始化失敗，服務仍會啟動，但需修正後才能使用資料庫相關端點
 """
 from contextlib import asynccontextmanager
 import logging
@@ -47,7 +50,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="A.O.M Cafe 進銷存 API",
-    version="7.0.0",
+    version="8.0.0",
     docs_url="/docs",
     openapi_url="/openapi.json",
     redoc_url="/redoc",
@@ -122,9 +125,23 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     return payload
 
 
+def require_admin(current_user: dict = Depends(get_current_user)):
+    """
+    權限守衛：僅允許 role == "admin" 的使用者通過。
+    掛在需要管理者權限的端點上（例如進貨 /transactions/receive），
+    店員(staff)呼叫時會收到 403 Forbidden。
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="權限不足：僅管理者(admin)可執行此操作，店員(staff)僅可執行出貨"
+        )
+    return current_user
+
+
 @app.get("/")
 async def root():
-    return {"message": "A.O.M Cafe 進銷存 API v7.0.0", "status": "online"}
+    return {"message": "A.O.M Cafe 進銷存 API v8.0.0", "status": "online"}
 
 
 @app.get("/health")
@@ -156,7 +173,8 @@ async def login_for_access_token(
                              headers={"WWW-Authenticate": "Bearer"})
 
     access_token = auth.encode_token({
-        "sub": user["username"], "role": user["role"], "store_id": user["store_id"]
+        "sub": user["username"], "role": user["role"], "store_id": user["store_id"],
+        "user_id": user["user_id"]
     })
     return {
         "access_token": access_token, "token_type": "bearer",
@@ -219,8 +237,8 @@ async def get_batches(store_id: int = Query(...), current_user: dict = Depends(g
     return result
 
 
-@app.post("/transactions/receive", response_model=SuccessResponse, summary="進貨登錄")
-async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_current_user)):
+@app.post("/transactions/receive", response_model=SuccessResponse, summary="進貨登錄（限管理者 admin）")
+async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(require_admin)):
     try:
         fifo.receive_stock(
             sku_no=req.sku_no,
@@ -235,11 +253,13 @@ async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_cu
         new_total = position.total_qty_g if position else req.qty_g
         return {"status": "success", "message": "進貨成功：" + str(req.qty_g) + "g",
                 "new_total_qty_g": new_total}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/transactions/issue", response_model=SuccessResponse, summary="出貨登錄")
+@app.post("/transactions/issue", response_model=SuccessResponse, summary="出貨登錄（admin/staff皆可）")
 async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_current_user)):
     try:
         fifo.issue_stock(
@@ -274,11 +294,12 @@ async def list_transactions(store_id: int = Query(...), start_date: Optional[str
     return rows
 
 
-@app.get("/reports/inventory", summary="匯出進貨報表（依批次明細）")
-async def export_inventory_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+@app.get("/reports/inventory", summary="匯出進貨報表（限管理者 admin）")
+async def export_inventory_report(store_id: int = Query(...), current_user: dict = Depends(require_admin)):
     """
     進貨報表欄位：SKU, 品名, 進貨日期, 供應商, 當批次進貨價(NT$/100g),
     進貨量(g), 出庫量(g), 剩餘庫存量(g)
+    僅管理者可查看（涉及成本資訊，店員不可查看）。
     """
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -296,10 +317,11 @@ async def export_inventory_report(store_id: int = Query(...), current_user: dict
                               headers={"Content-Disposition": "attachment; filename=inventory_report.csv"})
 
 
-@app.get("/reports/transactions", summary="匯出出貨報表（僅 OUT 類型交易）")
-async def export_transactions_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+@app.get("/reports/transactions", summary="匯出出貨報表（限管理者 admin，僅 OUT 類型交易）")
+async def export_transactions_report(store_id: int = Query(...), current_user: dict = Depends(require_admin)):
     """
     出貨報表欄位：日期, SKU, 數量(g), 單價(NT$/g), 總額, 通路（僅顯示 OUT 出貨交易）
+    僅管理者可查看（涉及損益資訊，店員不可查看完整報表）。
     """
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
