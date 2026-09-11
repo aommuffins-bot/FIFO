@@ -8,6 +8,13 @@ auth.py -- 權限管理層：使用者驗證、角色控制
 實作說明：
 - 密碼雜湊：使用 Python 標準庫 hashlib.pbkdf2_hmac
 - Token 機制：輕量級自製 JWT(HS256)，僅依賴標準庫，無需額外安裝 python-jose
+
+v2 修正紀錄：
+- seed_known_accounts() 改為「強制校正密碼」邏輯：
+  系統內建帳號（admin/aom_founder/aom_staff）若已存在於資料庫，
+  但密碼與程式碼中指定的已知密碼不符（例如資料庫殘留舊版本的密碼），
+  會自動更新為程式碼中指定的密碼，確保每次部署後這幾組帳密必定可登入。
+  （此設計僅適用於系統固定帳號，不影響一般使用者未來自訂密碼的彈性）
 """
 
 import os
@@ -93,6 +100,19 @@ def create_user(username: str, password: str, role: str, store_id: Optional[int]
         return result.inserted_primary_key[0]
 
 
+def update_password(username: str, new_password: str) -> None:
+    """強制更新指定帳號的密碼（不論目前密碼為何）。"""
+    pw_hash, salt = hash_password(new_password)
+    with get_conn() as conn:
+        conn.execute(
+            text(
+                "UPDATE users SET password_hash = :h, password_salt = :s "
+                "WHERE username = :u"
+            ),
+            {"h": pw_hash, "s": salt, "u": username}
+        )
+
+
 def authenticate(username: str, password: str) -> Optional[dict]:
     with get_conn() as conn:
         row = conn.execute(
@@ -120,15 +140,32 @@ def user_exists(username: str) -> bool:
         return bool(count)
 
 
+# 系統內建固定帳號（帳號、密碼、角色）：每次啟動皆會強制校正密碼
+KNOWN_ACCOUNTS = [
+    ("admin", "admin123", "admin"),
+    ("aom_founder", "Dc20220111", "admin"),
+    ("aom_staff", "aomstaff008", "staff"),
+]
+
+
 def seed_known_accounts():
     """
-    確保系統預設帳號存在於真實資料庫中（若不存在才建立）。
-    - admin / aom_founder：管理者角色，可進貨/出貨/查看完整報表
-    - aom_staff：店員角色，僅可執行出貨，無法進貨或查看成本/毛利數據
+    確保系統預設帳號存在於真實資料庫中，且密碼與下方 KNOWN_ACCOUNTS 一致：
+    - 帳號不存在 -> 建立新帳號
+    - 帳號已存在但密碼不符（例如資料庫殘留舊版本密碼）-> 強制更新為指定密碼
+    此設計確保無論資料庫先前狀態為何，系統固定帳號永遠可用指定密碼登入，
+    避免因新舊版本密碼設定不一致導致「帳密正確卻登入失敗」的問題。
     """
-    if not user_exists("admin"):
-        create_user("admin", "admin123", role="admin", store_id=1)
-    if not user_exists("aom_founder"):
-        create_user("aom_founder", "Dc20220111", role="admin", store_id=1)
-    if not user_exists("aom_staff"):
-        create_user("aom_staff", "aomstaff008", role="staff", store_id=1)
+    for username, password, role in KNOWN_ACCOUNTS:
+        if not user_exists(username):
+            create_user(username, password, role=role, store_id=1)
+        else:
+            with get_conn() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT password_hash, password_salt FROM users WHERE username = :u"
+                    ),
+                    {"u": username}
+                ).mappings().first()
+            if row and not verify_password(password, row["password_hash"], row["password_salt"]):
+                update_password(username, password)
