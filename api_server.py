@@ -1,15 +1,13 @@
 """
-api_server.py -- A.O.M Cafe Jin-Xiao-Cun API v6
-Update: startup lifespan now calls seed_115sku.seed() to populate the real
-database (via db_engine.py / SQLAlchemy) with the 115 SKU master data.
-If the database seed fails for any reason (missing dependency, no DB
-connection, files not deployed together, etc.), the app does NOT crash --
-it falls back to using the 115 SKU list embedded directly in this file
-(PRODUCTS_DATA below), so the API always stays available.
-
-Report columns (from v5) are unchanged:
-- inventory report: batch cost / received qty / issued qty / supplier / receive date
-- transactions report: OUT only, unit price labeled (g), channel supports custom text
+api_server.py -- A.O.M Cafe 進銷存 API v7
+------------------------------------------------------------------------
+本版本改為真正串接資料庫（db_engine.py + fifo_engine_v2.py + auth.py），
+取代先前的記憶體字典版本：
+1. 進貨 / 出貨 / 庫存查詢皆呼叫 fifo_engine_v2.py 的 FIFO 引擎，寫入真實資料庫
+2. 登入機制改回 auth.py 的 PBKDF2 + 自製 JWT（HS256）
+3. 啟動時呼叫 seed_135sku.seed() 寫入 135 筆商品主檔，並確保既有帳號存在
+4. 若資料庫初始化失敗（例如缺少相依檔案），服務仍會啟動，但需要修正後才能使用
+   進貨/出貨/庫存等資料庫功能（/health 與 /docs 不受影響）
 """
 from contextlib import asynccontextmanager
 import logging
@@ -18,170 +16,38 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List
-import jwt
-import hashlib
 import os
 
 logger = logging.getLogger("uvicorn.error")
 
-# PRODUCTS_DATA mirrors the 115-row PRODUCTS list in seed_115sku.py.
-# Column order: sku_no, continent, country, name, process, variety, flavor,
-# rating, strategy, batch_hint, cost_range_raw, cost_ntd_100g_raw,
-# retail_ntd_100g_raw, margin_pct_raw, notes, season, importer,
-# shelf_life_months, is_active
-PRODUCTS_DATA = [
-(1, '非洲', '衣索比亞', '耶加雪菲 Yirgacheffe G1', '水洗', '阿拉比卡/原生種', '花香、茉莉、柑橘、明亮檸檬酸', '★★★★☆', '核心必備', '依規格', 'USD 8~10/kg', '', '250~350', '', '耶加雪菲 Yirgacheffe G1（衣索比亞）', '全年', '圓石/守成/豆超', 9, 1),
-(2, '非洲', '衣索比亞', '耶加雪菲 日曬 G1', '日曬', '阿拉比卡/原生種', '藍莓、熱帶水果、酒香、甜感飽滿', '★★★★☆', '核心必備', '依規格', 'USD 9~12/kg', '', '300~420', '', '耶加雪菲 日曬 G1（衣索比亞）', '全年', '圓石/守成/豆超', 9, 1),
-(3, '非洲', '衣索比亞', '西達摩 Sidama G2', '水洗', '阿拉比卡/原生種', '巧克力、太妃糖、溫和果酸', '★★★★☆', '主力品項', '依規格', 'USD 6~8/kg', '', '200~280', '', '西達摩 Sidama G2（衣索比亞）', '全年', '豐潤/守成', 9, 1),
-(4, '非洲', '衣索比亞', '谷吉 Guji G1 日曬', '日曬', '阿拉比卡/原生種', '芒果、桃子、果凍感、甜感極佳', '★★★★☆', '精品核心', '依規格', 'USD 10~15/kg', '', '380~500', '', '谷吉 Guji G1 日曬（衣索比亞）', '全年', '守成/歐若', 9, 1),
-(5, '非洲', '衣索比亞', '哈拉 Harrar G4 日曬', '日曬', '阿拉比卡/原生種', '藍莓干、黑巧克力、狂野土壤味', '★★★★☆', '特色品項', '依規格', 'USD 5~7/kg', '', '250~320', '', '哈拉 Harrar G4 日曬（衣索比亞）', '全年', '豐潤', 9, 1),
-(6, '非洲', '衣索比亞', '沃卡 Worka 合作社', '水洗', '阿拉比卡/原生種', '玫瑰、茉莉、荔枝、優雅花果', '★★★★☆', '精品限定', '依規格', 'USD 12~18/kg', '', '400~550', '', '沃卡 Worka 合作社（衣索比亞）', '全年', '守成/圓石', 9, 1),
-(7, '非洲', '衣索比亞', '班奇馬吉 Bench Maji', '蜜處理', '阿拉比卡/原生種', '紅糖、苦橙皮、中厚實口感', '★★★★☆', '主力品項', '依規格', 'USD 8~11/kg', '', '280~360', '', '班奇馬吉 Bench Maji（衣索比亞）', '全年', '守成', 9, 1),
-(8, '非洲', '衣索比亞', '衣索比亞 厭氧發酵 Anaerobic', '厭氧日曬', '原生種', '酒香、熱帶果汁、強烈個性', '★★★★☆', '潮流必備', '依規格', 'USD 14~20/kg', '', '450~650', '', '衣索比亞 厭氧發酵 Anaerobic（衣索比亞）', '全年', '守成', 9, 1),
-(9, '非洲', '衣索比亞', '衣索比亞 Shakiso G1', '水洗', '原生種', '茉莉、覆盆莓、最高分耶加', '★★★★☆', '頂級精品', '依規格', 'USD 14~20/kg', '', '500~750', '', '衣索比亞 Shakiso G1（衣索比亞）', '全年', '守成', 9, 1),
-(10, '非洲', '衣索比亞', '衣索比亞 Bombe G1 日曬', '日曬', '原生種', '番茄汁、熱帶水果、深邃', '★★★★☆', '頂級限定', '依規格', 'USD 14~22/kg', '', '550~800', '', '衣索比亞 Bombe G1 日曬（衣索比亞）', '全年', '守成', 9, 1),
-(11, '非洲', '衣索比亞', '衣索比亞 Kochere 水洗', '水洗', '原生種', '檀香、佛手柑、絲滑質地', '★★★★☆', '精品品項', '依規格', 'USD 13~18/kg', '', '420~580', '', '衣索比亞 Kochere 水洗（衣索比亞）', '全年', '守成', 9, 1),
-(12, '非洲', '衣索比亞', '衣索比亞 Limu 水洗', '水洗', '原生種', '檸檬草、蜂蜜、柔和均衡', '★★★★☆', '主力品項', '依規格', 'USD 6~8/kg', '', '220~300', '', '衣索比亞 Limu 水洗（衣索比亞）', '全年', '豐潤', 9, 1),
-(13, '非洲', '衣索比亞', '衣索比亞 99合作社 水洗', '水洗', '原生種', '花香、荔枝、極致純淨感', '★★★★☆', '頂級精品', '依規格', 'USD 15~22/kg', '', '480~680', '', '衣索比亞 99合作社 水洗（衣索比亞）', '全年', '守成', 9, 1),
-(14, '非洲', '肯亞', '肯亞 AA 水洗', '水洗', 'SL28/SL34', '黑醋栗、番茄、莓果酸感強烈', '★★★★☆', '核心必備', '依規格', 'USD 9~13/kg', '', '280~400', '', '肯亞 AA 水洗（肯亞）', '全年', '圓石/守成/豆超', 9, 1),
-(15, '非洲', '肯亞', '肯亞 AB 水洗', '水洗', 'SL28/SL34', '黑醋栗、柑橘、明亮酸', '★★★★☆', '主力品項', '依規格', 'USD 7~9/kg', '', '220~300', '', '肯亞 AB 水洗（肯亞）', '全年', '豐潤/守成', 9, 1),
-(16, '非洲', '肯亞', '基里尼亞加 Kirinyaga PB', '水洗', 'SL28/SL34', '小圓豆，濃郁莓果、甜感集中', '★★★★☆', '特色品項', '依規格', 'USD 11~15/kg', '', '350~460', '', '基里尼亞加 Kirinyaga PB（肯亞）', '全年', '圓石', 9, 1),
-(17, '非洲', '肯亞', '肯亞 Washed Batian', '水洗', 'Batian', '黑醋栗加強版、層次豐富', '★★★★☆', '精品品項', '依規格', 'USD 12~16/kg', '', '380~500', '', '肯亞 Washed Batian（肯亞）', '全年', '圓石', 9, 1),
-(18, '非洲', '肯亞', '肯亞 Nyeri 水洗', '水洗', 'SL28/SL34', '黑莓、蜂蜜、飽滿酸甜', '★★★★☆', '主力品項', '依規格', 'USD 10~14/kg', '', '320~440', '', '肯亞 Nyeri 水洗（肯亞）', '全年', '圓石', 9, 1),
-(19, '非洲', '盧安達', '盧安達 Muhondo 水洗', '水洗', '波旁', '紅蘋果、柑橘、甜感溫和', '★★★★☆', '主力品項', '依規格', 'USD 7~10/kg', '', '240~320', '', '盧安達 Muhondo 水洗（盧安達）', '全年', '台非咖啡', 9, 1),
-(20, '非洲', '盧安達', '盧安達 CM Washing Station', '二氧化碳浸漬水洗', '波旁', '清透莓果、精準風味', '★★★★☆', '精品品項', '依規格', 'USD 12~16/kg', '', '380~500', '', '盧安達 CM Washing Station（盧安達）', '全年', '台非咖啡', 9, 1),
-(21, '非洲', '蒲隆地', '蒲隆地 Kayanza 水洗', '水洗', '波旁', '覆盆莓、蜜桃、花香', '★★★★☆', '精品品項', '依規格', 'USD 9~12/kg', '', '300~400', '', '蒲隆地 Kayanza 水洗（蒲隆地）', '全年', '台非咖啡/守成', 9, 1),
-(22, '非洲', '坦尚尼亞', '坦尚尼亞 AA Kilimanjaro', '水洗', '波旁/肯特', '黑糖、葡萄、中厚實', '★★★★☆', '特色品項', '依規格', 'USD 7~9/kg', '', '240~320', '', '坦尚尼亞 AA Kilimanjaro（坦尚尼亞）', '全年', '台非咖啡', 9, 1),
-(23, '非洲', '剛果', '剛果 Kivu 日曬', '日曬', '原生種', '深果乾、可可豆、大地氣息', '★★★★☆', '特色限定', '依規格', 'USD 8~11/kg', '', '280~380', '', '剛果 Kivu 日曬（剛果）', '全年', '台非咖啡', 9, 1),
-(24, '非洲', '葉門', '葉門 Mokha 原生種', '日曬', '原生種混合', '黑巧克力、野生莓果、複雜層次', '★★★★☆', '高端限定', '依規格', 'USD 30~50/kg', '', '600~1000', '', '葉門 Mokha 原生種（葉門）', '全年', '守成/特定進口', 9, 1),
-(25, '非洲', '馬拉威', '馬拉威 Mzuzu 水洗', '水洗', '波旁/卡杜拉', '柑橘、堅果、輕發酵香', '★★★★☆', '話題限定', '依規格', 'USD 8~11/kg', '', '260~360', '', '馬拉威 Mzuzu 水洗（馬拉威）', '全年', '台非咖啡', 9, 1),
-(26, '非洲', '尚比亞', '尚比亞 Terranova 莊園', '水洗', '波旁', '紅茶、柑橘、細膻優雅', '★★★★☆', '話題限定', '依規格', 'USD 10~14/kg', '', '300~420', '', '尚比亞 Terranova 莊園（尚比亞）', '全年', '台非咖啡', 9, 1),
-(27, '中南美洲', '哥倫比亞', '哥倫比亞 Huila Supremo', '水洗', '卡杜拉/蒂皮卡', '焦糖、紅蘋果、溫和甜酸', '★★★★☆', '核心必備', '依規格', 'USD 5~7/kg', '', '180~260', '', '哥倫比亞 Huila Supremo（哥倫比亞）', '全年', '圓石/豆超/豐潤', 9, 1),
-(28, '中南美洲', '哥倫比亞', '哥倫比亞 Nariño 水洗', '水洗', '卡杜拉', '柑橘花香、明亮果酸、優雅', '★★★★☆', '核心精品', '依規格', 'USD 6~9/kg', '', '220~300', '', '哥倫比亞 Nariño 水洗（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(29, '中南美洲', '哥倫比亞', '哥倫比亞 厭氧日曬', '厭氧日曬', '卡杜拉', '熱帶水果炸彈、濃烈發酵香', '★★★★☆', '潮流必備', '依規格', 'USD 10~16/kg', '', '350~500', '', '哥倫比亞 厭氧日曬（哥倫比亞）', '全年', '守成/圓石', 9, 1),
-(30, '中南美洲', '哥倫比亞', '哥倫比亞 El Paraiso 莊園', '厭氧蜜處理', '卡杜拉', '菠蘿、荔枝、波本威士忌桶香', '★★★★☆', '頂級限定', '依規格', 'USD 40~80/kg', '', '800~1500', '', '哥倫比亞 El Paraiso 莊園（哥倫比亞）', '全年', '守成特供', 9, 1),
-(31, '中南美洲', '哥倫比亞', '哥倫比亞 Rosa 玫瑰日曬', '玫瑰日曬', '卡杜拉', '玫瑰花茶、草莓、甜感優雅', '★★★★☆', '潮流品項', '依規格', 'USD 15~25/kg', '', '400~600', '', '哥倫比亞 Rosa 玫瑰日曬（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(32, '中南美洲', '哥倫比亞', '哥倫比亞 Castillo 厭氧水洗', '厭氧水洗', 'Castillo', '綠葡萄、火龍果、輕發酵香', '★★★★☆', '潮流品項', '依規格', 'USD 10~16/kg', '', '300~420', '', '哥倫比亞 Castillo 厭氧水洗（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(33, '中南美洲', '哥倫比亞', '哥倫比亞 Caturra 天然發酵', '天然發酵', '卡杜拉', '覆盆莓、發酵果汁感', '★★★★☆', '潮流品項', '依規格', 'USD 11~16/kg', '', '350~500', '', '哥倫比亞 Caturra 天然發酵（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(34, '中南美洲', '哥倫比亞', '哥倫比亞 Carbonic Maceration', '二氧化碳浸漬', '卡杜拉', '葡萄酒香、清透、精密處理', '★★★★☆', '潮流必備', '依規格', 'USD 20~35/kg', '', '500~800', '', '哥倫比亞 Carbonic Maceration（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(35, '中南美洲', '哥倫比亞', '哥倫比亞 Pink Bourbon 粉波旁', '水洗', '粉波旁', '玫瑰荔枝、草莓、極甜感', '★★★★☆', '話題必備', '依規格', 'USD 20~40/kg', '', '600~1000', '', '哥倫比亞 Pink Bourbon 粉波旁（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(36, '中南美洲', '哥倫比亞', '哥倫比亞 Yeast Ferment 酵母發酵', '酵母加強發酵', '卡杜拉', '桂皮、可可、複雜美學', '★★★★☆', '實驗潮流', '依規格', 'USD 15~25/kg', '', '450~650', '', '哥倫比亞 Yeast Ferment 酵母發酵（哥倫比亞）', '全年', '守成/歐若', 9, 1),
-(37, '中南美洲', '哥倫比亞', '哥倫比亞 Tabi 水洗', '水洗', 'Tabi', '柑橘、花香、獨特品種風味', '★★★★☆', '話題品項', '依規格', 'USD 11~15/kg', '', '380~500', '', '哥倫比亞 Tabi 水洗（哥倫比亞）', '全年', '歐若', 9, 1),
-(38, '中南美洲', '哥倫比亞', '哥倫比亞 Sudan Rume 蘇丹魯迷', '水洗', '蘇丹魯迷', '草本、柑橘、罕見基因品種', '★★★★☆', '話題限定', '依規格', 'USD 25~40/kg', '', '550~800', '', '哥倫比亞 Sudan Rume 蘇丹魯迷（哥倫比亞）', '全年', '守成特供', 9, 1),
-(39, '中南美洲', '巴西', '巴西 Santos NY2 日曬', '日曬', '波旁/卡杜拉', '堅果、黑巧克力、低酸厚實', '★★★★☆', '核心必備', '依規格', 'USD 3.5~4.5/kg', '', '120~180', '', '巴西 Santos NY2 日曬（巴西）', '全年', '豐潤/豆超', 9, 1),
-(40, '中南美洲', '巴西', '巴西 Mogiana 日曬', '日曬', '波旁/卡杜拉', '黃糖、堅果、柔順均衡', '★★★★☆', '核心必備', '依規格', 'USD 4~5.5/kg', '', '150~200', '', '巴西 Mogiana 日曬（巴西）', '全年', '豐潤/守成', 9, 1),
-(41, '中南美洲', '巴西', '巴西 黃波旁 日曬', '日曬', '黃波旁', '桃子、杏仁、甜感突出', '★★★★☆', '精品品項', '依規格', 'USD 6~9/kg', '', '200~280', '', '巴西 黃波旁 日曬（巴西）', '全年', '守成/歐若', 9, 1),
-(42, '中南美洲', '巴西', '巴西 Natural Pulped', '去果皮日曬', '波旁', '焦糖、蜂蜜、輕果香', '★★★★☆', '主力品項', '依規格', 'USD 4.5~6/kg', '', '160~220', '', '巴西 Natural Pulped（巴西）', '全年', '豆超/豐潤', 9, 1),
-(43, '中南美洲', '巴西', '巴西 CoE 競標批次', '日曬/水洗', '多品種', '依批次，高分精品特色', '★★★★☆', '年度限定', '依規格', 'USD 20~60/kg', '', '800~2000', '', '巴西 CoE 競標批次（巴西）', '全年', '守成特供', 9, 1),
-(44, '中南美洲', '巴西', '巴西 Anaerobic Natural', '厭氧日曬', '黃波旁', '熱帶水果、深度甜感、酒香', '★★★★☆', '潮流品項', '依規格', 'USD 8~12/kg', '', '280~380', '', '巴西 Anaerobic Natural（巴西）', '全年', '守成', 9, 1),
-(45, '中南美洲', '巴西', '巴西 Geisha 日曬', '日曬', '藝伎', '花香、蜂蜜、意外的細膻感', '★★★★☆', '精品限定', '依規格', 'USD 35~55/kg', '', '900~1400', '', '巴西 Geisha 日曬（巴西）', '全年', '守成特供', 9, 1),
-(46, '中南美洲', '瓜地馬拉', '瓜地馬拉 Antigua SHB', '水洗', '波旁/卡杜拉', '黑糖、可可、輕煙燻', '★★★★☆', '核心必備', '依規格', 'USD 5~7/kg', '', '200~280', '', '瓜地馬拉 Antigua SHB（瓜地馬拉）', '全年', '圓石/歐若', 9, 1),
-(47, '中南美洲', '瓜地馬拉', '瓜地馬拉 Huehuetenango', '水洗', '波旁', '花香、糖蜜、柑橘', '★★★★☆', '主力品項', '依規格', 'USD 6~8/kg', '', '220~300', '', '瓜地馬拉 Huehuetenango（瓜地馬拉）', '全年', '圓石/歐若', 9, 1),
-(48, '中南美洲', '瓜地馬拉', '瓜地馬拉 蜜處理', '蜜處理', '卡杜拉', '甜感溫潤、焦糖、輕果香', '★★★★☆', '主力品項', '依規格', 'USD 7~10/kg', '', '250~340', '', '瓜地馬拉 蜜處理（瓜地馬拉）', '全年', '歐若', 9, 1),
-(49, '中南美洲', '瓜地馬拉', '瓜地馬拉 Catuai 日曬', '日曬', '卡杜艾', '深色水果、黑糖、厚實', '★★★★☆', '主力品項', '依規格', 'USD 7~10/kg', '', '240~320', '', '瓜地馬拉 Catuai 日曬（瓜地馬拉）', '全年', '圓石', 9, 1),
-(50, '中南美洲', '瓜地馬拉', '瓜地馬拉 Pacamara 蜜處理', '蜜處理', '帕卡馬拉', '熱帶水果、大顆粒、飽滿甜感', '★★★★☆', '特色品項', '依規格', 'USD 9~13/kg', '', '320~420', '', '瓜地馬拉 Pacamara 蜜處理（瓜地馬拉）', '全年', '圓石', 9, 1),
-(51, '中南美洲', '瓜地馬拉', '瓜地馬拉 Valle Nuevo莊園（阿卡特南果）', '水洗', '卡杜拉/卡杜艾/帕契', '明亮酸感、香氣馥郁、均衡厚實、乾淨尾韻', '★★★★☆', '特色莊園', '1500 quintals', 'USD 5.91/kg', '', '200~280', '', '阿卡特南果產區，海拔800~900m，10~12月產季', '10-12月', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(52, '中南美洲', '瓜地馬拉', '瓜地馬拉 La Giralda莊園（阿卡特南果）', '水洗', '卡杜拉/卡杜艾/帕契可利斯', '明亮酸感、香氣馥郁、均衡厚實、乾淨尾韻', '★★★★☆', 'SHB精品莊園', '2000 quintals', 'USD 6.30/kg', '', '230~310', '', '阿卡特南果/安提瓜交界，海拔1800~2000m，SHB嚴選硬豆', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(53, '中南美洲', '瓜地馬拉', '瓜地馬拉 La Granadia莊園（阿卡特南果）', '水洗', '卡杜艾/帕契聖拉蒙/卡杜拉', '明亮酸感、香氣馥郁、均衡厚實、乾淨尾韻', '★★★★☆', 'SHB精品莊園', '1500 quintals', 'USD 6.25/kg', '', '225~305', '', '阿卡特南果火山山坡，SHB嚴選硬豆', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(54, '中南美洲', '瓜地馬拉', '瓜地馬拉 韋韋特南戈產區', '水洗', '依規格', '細緻強勁酸感、飽滿厚實、宜人酒香', '★★★★☆', '高海拔產區', '依規格', 'USD 6.30/kg', '', '230~310', '', '韋韋特南戈產區，海拔可達2000m，乾熱風保護免受霜害', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(55, '中南美洲', '瓜地馬拉', '瓜地馬拉 科班產區 SHB水洗', '水洗', '依規格', '鮮明水果調、細緻均衡、宜人香氣', '★★★★☆', 'SHB產區', '依規格', 'USD 5.98/kg', '', '215~290', '', '科班產區，海拔1700m，全年多雨微濕氣候', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(56, '中南美洲', '瓜地馬拉', '瓜地馬拉 San Pedro la Laguna莊園（阿蒂特蘭）', '水洗', '卡杜拉/帕契/卡杜艾', '明亮柑橘酸、飽滿厚實、迷人香氣', '★★★★☆', '火山湖畔莊園', '年產12000 quintals', 'USD 6.27/kg', '', '225~305', '', '阿蒂特蘭火山湖畔，海拔1600~1800m', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(57, '中南美洲', '瓜地馬拉', '瓜地馬拉 Patzulí莊園（安提瓜）', '水洗', '哥斯大黎加種/卡杜艾/黃卡杜艾/波旁', '優雅均衡、濃郁香氣、極其香甜', '★★★★☆', '安提瓜精品莊園', '2000 quintals', 'USD 6.30/kg', '', '230~310', '', '安提瓜產區，海拔1600m，Chimaltenango與Sacatepéquez交界', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(58, '中南美洲', '瓜地馬拉', '瓜地馬拉 La Ponderosa莊園（安提瓜）', '水洗', 'Ana Café14/卡杜艾/卡杜拉/帕契可利斯', '優雅均衡、濃郁香氣、極其香甜', '★★★★☆', 'SHB安提瓜莊園', '1800 quintals', 'USD 6.25/kg', '', '225~305', '', '安提瓜Agua火山山坡，海拔1500~1600m，火山土壤', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(59, '中南美洲', '瓜地馬拉', '瓜地馬拉 La Chacara莊園（安提瓜）', '水洗', '卡杜艾/卡杜拉/黃卡杜艾', '優雅均衡、濃郁香氣、極其香甜', '★★★★☆', 'SHB安提瓜莊園', '2000 quintals', 'USD 6.40/kg', '', '235~315', '', 'San Martin Jilotepeque，海拔1800~1900m', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(60, '中南美洲', '瓜地馬拉', '瓜地馬拉 新東方產區（Barberena）', '水洗', '依規格', '均衡厚實、帶巧克力調', '★★★★☆', '新興產區', '4000 quintals', 'USD 5.90/kg', '', '215~290', '', 'Barberena Santa Rosa，海拔1300m', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(61, '中南美洲', '瓜地馬拉', '瓜地馬拉 La Cosecha莊園（弗拉哈內斯）', '水洗', 'Ana Café14/Salchimor/卡杜拉', '明亮持久酸感、香氣馥郁、層次分明', '★★★★☆', '火山礦質莊園', '1300 quintals', 'USD 5.98/kg', '', '215~290', '', '弗拉哈內斯高原，Pacaya火山山坡，海拔1700m', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(62, '中南美洲', '瓜地馬拉', '瓜地馬拉 San Rafael莊園（聖馬科斯）', '水洗', '波旁/卡杜拉/Ana Café14', '細緻花香、明亮酸感、良好厚實度', '★★★★☆', 'SHB高海拔莊園', '2000 quintals', 'USD 6.15/kg', '', '225~305', '', '聖馬科斯Tacana火山山坡，海拔1900m，SHB嚴選硬豆', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(63, '中南美洲', '瓜地馬拉', '瓜地馬拉 San Pedro la Laguna莊園 日曬（阿蒂特蘭）', '日曬', '卡杜拉/帕契/卡杜艾', '明亮柑橘酸、飽滿厚實、發酵果香', '★★★★☆', 'FOB日曬批次', '年產12000 quintals', 'USD 6.30/kg FOB', '', '230~310', '', '阿蒂特蘭，海拔1600~1800m，Natural處理', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(64, '中南美洲', '瓜地馬拉', '瓜地馬拉 San Pedro la Laguna莊園 蜜處理（阿蒂特蘭）', '蜜處理', '卡杜拉/帕契/卡杜艾', '明亮柑橘酸、蜂蜜甜感、飽滿厚實', '★★★★☆', 'FOB蜜處理批次', '年產12000 quintals', 'USD 6.30/kg FOB', '', '230~310', '', '阿蒂特蘭，海拔1600~1800m，Honey處理', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(65, '中南美洲', '瓜地馬拉', '瓜地馬拉 San Pedro la Laguna莊園 水洗FOB（阿蒂特蘭）', '水洗', '卡杜拉/帕契/卡杜艾', '明亮柑橘酸、乾淨明亮、飽滿厚實', '★★★★☆', 'FOB水洗批次', '年產12000 quintals', 'USD 5.90/kg FOB', '', '215~290', '', '阿蒂特蘭，海拔1600~1800m，Lavado水洗處理', '全年', 'Guatemala直採莊園/A.O.M直接採購', 9, 1),
-(66, '中南美洲', '巴拿馬', '巴拿馬 藝伎 Geisha 水洗', '水洗', '藝伎/Geisha', '茉莉、佛手柑、蜂蜜、絲滑', '★★★★☆', '高端必備', '依規格', 'USD 60~150/kg', '', '1500~3500', '', '巴拿馬 藝伎 Geisha 水洗（巴拿馬）', '全年', '守成/圓石', 9, 1),
-(67, '中南美洲', '巴拿馬', '巴拿馬 藝伎 日曬', '日曬', '藝伎/Geisha', '熱帶水果炸彈、複雜層次', '★★★★☆', '頂級限定', '依規格', 'USD 80~200/kg', '', '2000~5000', '', '巴拿馬 藝伎 日曬（巴拿馬）', '全年', '守成特供', 9, 1),
-(68, '中南美洲', '巴拿馬', '巴拿馬 Elida 莊園 Geisha', '水洗', '藝伎', 'BSCA全球高分，茶感、優雅', '★★★★☆', '競標限定', '依規格', 'USD 150~400/kg', '', '3000~8000', '', '巴拿馬 Elida 莊園 Geisha（巴拿馬）', '全年', '守成特供', 9, 1),
-(69, '中南美洲', '巴拿馬', '巴拿馬 SL28 微批次', '水洗', 'SL28', '莓果、柑橘、濃郁', '★★★★☆', '頂級限定', '依規格', 'USD 50~100/kg', '', '1500~3000', '', '巴拿馬 SL28 微批次（巴拿馬）', '全年', '守成', 9, 1),
-(70, '中南美洲', '巴拿馬', '巴拿馬 Esmeralda 莊園 水洗', '水洗', '藝伎/卡杜拉', '茉莉、蜂蜜、經典莊園代表', '★★★★☆', '高端限定', '依規格', 'USD 90~180/kg', '', '2200~4000', '', '巴拿馬 Esmeralda 莊園 水洗（巴拿馬）', '全年', '守成特供', 9, 1),
-(71, '中南美洲', '哥斯大黎加', 'Costa Rica Tarrazu SHB', '水洗', '卡杜拉', '柑橘、甜感、乾淨明亮', '★★★★☆', '核心必備', '依規格', 'USD 6~8/kg', '', '220~300', '', 'Costa Rica Tarrazu SHB（哥斯大黎加）', '全年', '守成/豆超', 9, 1),
-(72, '中南美洲', '哥斯大黎加', 'Costa Rica 蜜處理 黃蜜', '黃蜜', '卡杜拉', '蜜桃、焦糖、低酸甜感', '★★★★☆', '主力品項', '依規格', 'USD 7~10/kg', '', '280~360', '', 'Costa Rica 蜜處理 黃蜜（哥斯大黎加）', '全年', '守成/歐若', 9, 1),
-(73, '中南美洲', '哥斯大黎加', 'Costa Rica 黑蜜處理', '黑蜜', '卡杜拉', '紅糖、莓果、複雜甜感', '★★★★☆', '精品品項', '依規格', 'USD 9~13/kg', '', '320~420', '', 'Costa Rica 黑蜜處理（哥斯大黎加）', '全年', '守成', 9, 1),
-(74, '中南美洲', '哥斯大黎加', 'CR Honey Thermal Shock', '熱衝擊蜜', '卡杜拉', '獨特冷熱衝擊，甜感翻倍', '★★★★☆', '實驗限定', '依規格', 'USD 18~28/kg', '', '500~800', '', 'CR Honey Thermal Shock（哥斯大黎加）', '全年', '守成', 9, 1),
-(75, '中南美洲', '宏都拉斯', '宏都拉斯 Copan SHG', '水洗', '帕卡斯', '焦糖、深色水果、溫和酸', '★★★★☆', '主力品項', '依規格', 'USD 4.5~6/kg', '', '160~220', '', '宏都拉斯 Copan SHG（宏都拉斯）', '全年', '豆超/豐潤', 9, 1),
-(76, '中南美洲', '薩爾瓦多', '薩爾瓦多 Pacamara 日曬', '日曬', '帕卡馬拉', '甜蜜、熱帶水果、大顆粒', '★★★★☆', '特色品項', '依規格', 'USD 8~12/kg', '', '280~380', '', '薩爾瓦多 Pacamara 日曬（薩爾瓦多）', '全年', '守成/歐若', 9, 1),
-(77, '中南美洲', '尼加拉瓜', '尼加拉瓜 Jinotega 水洗', '水洗', '卡杜拉/IHCAFE90', '黑糖、焦糖、溫和莓果', '★★★★☆', '主力品項', '依規格', 'USD 5~6.5/kg', '', '180~240', '', '尼加拉瓜 Jinotega 水洗（尼加拉瓜）', '全年', '豆超', 9, 1),
-(78, '中南美洲', '秘魯', '秘魯 Cajamarca 有機', '水洗', '卡杜拉/典型種', '堅果、可可、輕果酸', '★★★★☆', '主力品項', '依規格', 'USD 5~7/kg', '', '180~240', '', '秘魯 Cajamarca 有機（秘魯）', '全年', '守成', 9, 1),
-(79, '中南美洲', '玻利維亞', '玻利維亞 Caranavi 水洗', '水洗', '蒂皮卡', '柑橘、杏桃、清透感', '★★★★☆', '特色品項', '依規格', 'USD 9~14/kg', '', '280~380', '', '玻利維亞 Caranavi 水洗（玻利維亞）', '全年', '守成', 9, 1),
-(80, '中南美洲', '墨西哥', '墨西哥 Chiapas 水洗', '水洗', '波旁/典型種', '堅果、可可、溫和甜感', '★★★★☆', '主力品項', '依規格', 'USD 5~7/kg', '', '180~250', '', '墨西哥 Chiapas 水洗（墨西哥）', '全年', '豆超', 9, 1),
-(81, '中南美洲', '厄瓜多', '厄瓜多 Loja 水洗', '水洗', '卡杜拉', '花香、蘋果、清爽明亮', '★★★★☆', '特色品項', '依規格', 'USD 7~10/kg', '', '240~330', '', '厄瓜多 Loja 水洗（厄瓜多）', '全年', '守成', 9, 1),
-(82, '亞洲', '印尼', '曼特寧 Mandheling G1', '半水洗', '鐵比卡', '黑土、松木、黑巧克力、低酸厚實', '★★★★☆', '核心必備', '依規格', 'USD 4.5~6/kg', '', '150~220', '', '曼特寧 Mandheling G1（印尼）', '全年', '豐潤/豆超', 9, 1),
-(83, '亞洲', '印尼', '托拉查 Toraja 半水洗', '半水洗', '鐵比卡/卡杜拉', '可可、辛香料、複雜土壤', '★★★★☆', '主力品項', '依規格', 'USD 5~7/kg', '', '180~250', '', '托拉查 Toraja 半水洗（印尼）', '全年', '豆超', 9, 1),
-(84, '亞洲', '印尼', 'Gayo 蓋優 G1', '半水洗/水洗', '鐵比卡', '草本、肉桂、薄荷、獨特', '★★★★☆', '特色品項', '依規格', 'USD 6~8/kg', '', '200~280', '', 'Gayo 蓋優 G1（印尼）', '全年', '守成', 9, 1),
-(85, '亞洲', '印尼', 'Flores Bajawa', '水洗', '鐵比卡', '薑汁、深色水果、厚重', '★★★★☆', '特色品項', '依規格', 'USD 6~9/kg', '', '220~300', '', 'Flores Bajawa（印尼）', '全年', '守成', 9, 1),
-(86, '亞洲', '印尼', '黃金曼特寧 Premium', '半水洗', '鐵比卡', '純淨、低酸、奶油堅果', '★★★★☆', '高端品項', '依規格', 'USD 9~13/kg', '', '300~420', '', '黃金曼特寧 Premium（印尼）', '全年', '守成/豆超', 9, 1),
-(87, '亞洲', '印尼', '爪哇 Java 莊園', '水洗', '鐵比卡', '土壤、木質、均衡', '★★★★☆', '特色品項', '依規格', 'USD 4~5.5/kg', '', '150~200', '', '爪哇 Java 莊園（印尼）', '全年', '豐潤', 9, 1),
-(88, '亞洲', '印尼', '印尼 黃金日曬 Wet Hulled', '濕剝法日曬', '鐵比卡', '陳年感、木桶、厚實', '★★★★☆', '特色品項', '依規格', 'USD 8~12/kg', '', '280~380', '', '印尼 黃金日曬 Wet Hulled（印尼）', '全年', '守成', 9, 1),
-(89, '亞洲', '印尼', '蘇拉維西 Sulawesi Kalosi', '半水洗', 'S795', '草本、辛香、厚實低酸', '★★★★☆', '特色品項', '依規格', 'USD 6~8/kg', '', '220~300', '', '蘇拉維西 Sulawesi Kalosi（印尼）', '全年', '豆超', 9, 1),
-(90, '亞洲', '印度', '印度 Monsooned Malabar', '季風處理', '羅布斯塔/阿拉比卡', '麥芽、木桶、低酸濃厚', '★★★★☆', '特色品項', '依規格', 'USD 5~7/kg', '', '200~270', '', '印度 Monsooned Malabar（印度）', '全年', '豐潤/守成', 9, 1),
-(91, '亞洲', '印度', '印度 Araku Valley 水洗', '水洗', '阿拉比卡', '花香、可可、柑橘', '★★★★☆', '精品品項', '依規格', 'USD 6~9/kg', '', '220~300', '', '印度 Araku Valley 水洗（印度）', '全年', '守成', 9, 1),
-(92, '亞洲', '印度', '印度 Bababudan Washed', '水洗', '肯特', '巧克力、輕香料、溫和', '★★★★☆', '特色品項', '依規格', 'USD 5~7/kg', '', '180~240', '', '印度 Bababudan Washed（印度）', '全年', '豐潤', 9, 1),
-(93, '亞洲', '印度', '印度 有機認證 水洗', '水洗', '阿拉比卡', '溫和花香、堅果、有機認證', '★★★★☆', '有機品項', '依規格', 'USD 6~8/kg', '', '240~320', '', '印度 有機認證 水洗（印度）', '全年', '豐潤', 9, 1),
-(94, '亞洲', '越南', '越南 大叻 Da Lat 阿拉比卡', '水洗', '卡杜拉', '花香果酸、輕盈、中等甜感', '★★★★☆', '特色品項', '依規格', 'USD 3.5~5/kg', '', '120~180', '', '越南 大叻 Da Lat 阿拉比卡（越南）', '全年', '信男國際', 9, 1),
-(95, '亞洲', '泰國', '泰國 清邁 Doi Chang 水洗', '水洗', '阿拉比卡', '核桃、輕花香、甜感溫和', '★★★★☆', '主力品項', '依規格', 'USD 5~7/kg', '', '180~240', '', '泰國 清邁 Doi Chang 水洗（泰國）', '全年', '信男國際', 9, 1),
-(96, '亞洲', '泰國', '泰國 Doi Tung 皇家計畫', '水洗', '阿拉比卡', '均衡甜感、花香、輕柑橘', '★★★★☆', '主力品項', '依規格', 'USD 6~8/kg', '', '220~300', '', '泰國 Doi Tung 皇家計畫（泰國）', '全年', '信男國際', 9, 1),
-(97, '亞洲', '緬甸', '緬甸 Shan State 水洗', '水洗', '阿拉比卡', '草本、柑橘皮、輕酸', '★★★★☆', '特色品項', '依規格', 'USD 4.5~6.5/kg', '', '160~220', '', '緬甸 Shan State 水洗（緬甸）', '全年', '守成', 9, 1),
-(98, '亞洲', '中國雲南', '雲南 保山 日曬', '日曬', '卡杜拉/卡蒂莫', '熱帶水果、草本、輕烘首選', '★★★★☆', '特色品項', '依規格', 'USD 4~6/kg', '', '140~200', '', '雲南 保山 日曬（中國雲南）', '全年', '豆超', 9, 1),
-(99, '亞洲', '菲律賓', '菲律賓 Sagada 水洗', '水洗', '本地品種', '溫和花香、輕甜感、低酸', '★★★★☆', '話題品項', '依規格', 'USD 6~9/kg', '', '200~280', '', '菲律賓 Sagada 水洗（菲律賓）', '全年', '特定進口', 9, 1),
-(100, '亞洲', '帝汶', '東帝汶 Timor 水洗', '水洗', '海布里多/帝汶混種', '土壤、草本、偶發莓果', '★★★★☆', '特色品項', '依規格', 'USD 5~7/kg', '', '160~220', '', '東帝汶 Timor 水洗（帝汶）', '全年', '守成', 9, 1),
-(101, '亞洲', '中國', '雲南 潞江壩 蜜處理', '蜜處理', '卡蒂莫', '焦糖、熱帶果香、新興產區話題', '★★★★☆', '話題品項', '依規格', 'USD 5~7/kg', '', '180~260', '', '雲南 潞江壩 蜜處理（中國）', '全年', '豆超', 9, 1),
-(102, '亞洲', '巴布亞紐幾內亞', '巴紐 Sigri 水洗', '水洗', '阿魯沙/藍山', '花香、柑橘、清爽明亮', '★★★★☆', '特色限定', '依規格', 'USD 7~10/kg', '', '260~350', '', '巴紐 Sigri 水洗（巴布亞紐幾內亞）', '全年', '特定進口', 9, 1),
-(103, '台灣', '台灣-嘉義', '阿里山 鐵比卡 日曬', '日曬', '鐵比卡', '花香、桃子、甜感、明亮', '★★★★☆', '核心台灣豆', '依規格', 'NT$1,500~3,000/kg', '', '800~1500', '', '阿里山 鐵比卡 日曬（台灣-嘉義）', '全年', '農糧署/農業部', 9, 1),
-(104, '台灣', '台灣-嘉義', '阿里山 藝伎 Geisha 日曬', '日曬', '藝伎', '極致花香、茉莉、國際驚艷', '★★★★☆', '頂級台灣豆', '依規格', 'NT$5,000~10,000/kg', '', '2500~5000', '', '阿里山 藝伎 Geisha 日曬（台灣-嘉義）', '全年', '特定農場直供', 9, 1),
-(105, '台灣', '台灣-嘉義', '番路 SCAA 競賽豆', '水洗/日曬', '多品種', '依批次，國際賽事品質', '★★★★☆', '競賽限定', '依規格', 'NT$6,000~20,000/kg', '', '3000~10000', '', '番路 SCAA 競賽豆（台灣-嘉義）', '全年', '指定農場', 9, 1),
-(106, '台灣', '台灣-嘉義', '梅山 有機認證 水洗', '水洗', '鐵比卡', '花香清爽、輕酸、有機認證', '★★★★☆', '有機品項', '依規格', 'NT$1,400~2,500/kg', '', '700~1200', '', '梅山 有機認證 水洗（台灣-嘉義）', '全年', '農業部', 9, 1),
-(107, '台灣', '台灣-嘉義', '太和 蜜處理', '蜜處理', '鐵比卡', '蜂蜜、輕花香、圓潤口感', '★★★★☆', '主力台灣豆', '依規格', 'NT$1,300~2,100/kg', '', '650~1050', '', '太和 蜜處理（台灣-嘉義）', '全年', '農糧署', 9, 1),
-(108, '台灣', '台灣-南投', '南投 埔里 日月潭 水洗', '水洗', '鐵比卡', '柑橘、焦糖、溫和甜感', '★★★★☆', '主力台灣豆', '依規格', 'NT$1,200~2,000/kg', '', '600~1000', '', '南投 埔里 日月潭 水洗（台灣-南投）', '全年', '農糧署', 9, 1),
-(109, '台灣', '台灣-南投', '南投 鹿谷 蜜處理', '蜜處理', '鐵比卡/卡杜拉', '茶感、輕蜂蜜、清甜', '★★★★☆', '主力台灣豆', '依規格', 'NT$1,200~2,000/kg', '', '600~1000', '', '南投 鹿谷 蜜處理（台灣-南投）', '全年', '農業部/農糧署', 9, 1),
-(110, '台灣', '台灣-南投', '國姓 日曬', '日曬', '鐵比卡', '果乾、甜感厚實、南投風土', '★★★★☆', '特色台灣豆', '依規格', 'NT$1,100~1,900/kg', '', '600~950', '', '國姓 日曬（台灣-南投）', '全年', '農業部', 9, 1),
-(111, '台灣', '台灣-雲林', '古坑咖啡 水洗', '水洗', '鐵比卡', '黑糖、烏梅、台式溫潤', '★★★★☆', '主力台灣豆', '依規格', 'NT$1,000~1,800/kg', '', '500~800', '', '古坑咖啡 水洗（台灣-雲林）', '全年', '農糧署', 9, 1),
-(112, '台灣', '台灣-雲林', '古坑 蜜處理 限定批', '蜜處理', '鐵比卡', '焦糖、烏梅、台式甜感升級版', '★★★★☆', '話題台灣豆', '依規格', 'NT$1,400~2,200/kg', '', '700~1100', '', '古坑 蜜處理 限定批（台灣-雲林）', '全年', '農糧署', 9, 1),
-(113, '台灣', '台灣-屏東', '屏東 三地門 日曬', '日曬', '阿拉比卡', '芒果、熱帶果香、南台灣風土', '★★★★☆', '特色台灣豆', '依規格', 'NT$1,200~2,000/kg', '', '600~1000', '', '屏東 三地門 日曬（台灣-屏東）', '全年', '農業部', 9, 1),
-(114, '台灣', '台灣-花蓮', '花蓮 玉里 水洗', '水洗', '鐵比卡', '清爽花香、輕甜、東台灣純淨', '★★★★☆', '特色台灣豆', '依規格', 'NT$1,000~1,800/kg', '', '550~900', '', '花蓮 玉里 水洗（台灣-花蓮）', '全年', '農業部', 9, 1),
-(115, '台灣', '台灣-台東', '台東 卑南 日曬', '日曬', '鐵比卡', '果乾、溫和甜感、輕發酵', '★★★★☆', '特色台灣豆', '依規格', 'NT$1,000~1,600/kg', '', '500~800', '', '台東 卑南 日曬（台灣-台東）', '全年', '農業部', 9, 1),
-]
+import db_engine
+import auth
+import fifo_engine_v2 as fifo
+import seed_135sku
+from sqlalchemy import text as _sql_text
 
-def _build_products_db(rows):
-    result = []
-    for row in rows:
-        result.append({
-            "sku_no": row[0],
-            "name": row[3],
-            "continent": row[1],
-            "country": row[2],
-            "process": row[4],
-            "variety": row[5],
-            "flavor": row[6],
-            "rating": row[7],
-        })
-    return result
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-PRODUCTS_DB = _build_products_db(PRODUCTS_DATA)
-
-INVENTORY_DB = {p["sku_no"]: {"sku_no": p["sku_no"], "name": p["name"], "batches": [], "total_qty_g": 0.0} for p in PRODUCTS_DB}
-TRANSACTIONS_DB = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        import seed_115sku
-        seed_115sku.seed()
-        logger.info("Startup: seed_115sku.seed() completed successfully (database populated with 115 SKU).")
+        db_engine.init_db()
+        seed_135sku.seed()
+        auth.seed_known_accounts()
+        logger.info("Startup: database initialized, 135 SKU seeded, accounts ensured.")
     except Exception as e:
-        logger.warning("Startup: seed_115sku.seed() failed (%s). Continuing with in-memory PRODUCTS_DATA (115 SKU) embedded in api_server.py.", e)
+        logger.warning("Startup: database initialization failed (%s). "
+                        "The service is still running, but /inventory, /transactions, "
+                        "/products and related endpoints will fail until this is fixed.", e)
     yield
 
+
 app = FastAPI(
-    title="A.O.M Cafe Jin-Xiao-Cun API",
-    version="6.0.0",
+    title="A.O.M Cafe 進銷存 API",
+    version="7.0.0",
     docs_url="/docs",
     openapi_url="/openapi.json",
     redoc_url="/redoc",
@@ -196,21 +62,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
-SECRET_KEY = os.environ.get("AOM_JWT_SECRET", "your-secret-key-change-in-production")
-ALGORITHM = "HS256"
-
-USERS_DB = {
-    "admin": {"user_id": 1, "username": "admin", "password_hash": hashlib.pbkdf2_hmac("sha256", "admin123".encode(), "salt123".encode(), 100000).hex(), "password_salt": "salt123", "role": "admin", "store_id": 1, "is_active": 1},
-    "aom_founder": {"user_id": 2, "username": "aom_founder", "password_hash": hashlib.pbkdf2_hmac("sha256", "Dc20220111".encode(), "salt456".encode(), 100000).hex(), "password_salt": "salt456", "role": "admin", "store_id": 1, "is_active": 1},
-}
 
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
     role: str
     store_id: int
+
 
 class ReceiveRequest(BaseModel):
     sku_no: int
@@ -221,11 +79,13 @@ class ReceiveRequest(BaseModel):
     flavor: Optional[str] = ""
     process: Optional[str] = ""
 
+
 class IssueRequest(BaseModel):
     sku_no: int
     qty_g: float
     sell_price_ntd_per_100g: float
     channel: str = "零售"
+
 
 class InventoryItem(BaseModel):
     sku_no: int
@@ -233,35 +93,6 @@ class InventoryItem(BaseModel):
     total_qty_g: float
     batch_count: int
 
-class BatchItem(BaseModel):
-    sku_no: int
-    batch_id: int
-    receive_date: str
-    original_qty_g: float
-    remaining_qty_g: float
-    issued_qty_g: float
-    cost_per_100g: float
-    supplier: str
-    origin: str
-    flavor: str
-    process: str
-
-class TransactionItem(BaseModel):
-    txn_id: int
-    sku_no: int
-    txn_type: str
-    txn_date: str
-    qty_g: float
-    unit_price_ntd_per_g: Optional[float] = None
-    total_amount_ntd: Optional[float] = None
-    channel: Optional[str] = None
-    timestamp: str
-
-class SuccessResponse(BaseModel):
-    status: str
-    message: str
-    new_total_qty_g: Optional[float] = None
-    batches_used: Optional[List[dict]] = None
 
 class ProductItem(BaseModel):
     sku_no: int
@@ -273,37 +104,35 @@ class ProductItem(BaseModel):
     flavor: str
     rating: str
 
-def hash_password(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
 
-def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=60)):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + expires_delta
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+class SuccessResponse(BaseModel):
+    status: str
+    message: str
+    new_total_qty_g: Optional[float] = None
+
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
-        user = USERS_DB.get(username)
-        if not user or not user["is_active"]:
-            raise HTTPException(status_code=401, detail="User not found", headers={"WWW-Authenticate": "Bearer"})
-        return user
-    except jwt.PyJWTError:
+        payload = auth.decode_token(token)
+    except auth.TokenError as e:
+        raise HTTPException(status_code=401, detail=str(e), headers={"WWW-Authenticate": "Bearer"})
+    username = payload.get("sub")
+    if not username:
         raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
+    return payload
+
 
 @app.get("/")
 async def root():
-    return {"message": "A.O.M Cafe Jin-Xiao-Cun API v6.0.0", "status": "online", "total_sku": len(PRODUCTS_DB)}
+    return {"message": "A.O.M Cafe 進銷存 API v7.0.0", "status": "online"}
+
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.post("/auth/login", response_model=Token, summary="Login")
+
+@app.post("/auth/login", response_model=Token, summary="使用者登入")
 async def login_for_access_token(
     username: Optional[str] = Query(None),
     password: Optional[str] = Query(None),
@@ -314,177 +143,178 @@ async def login_for_access_token(
         username = form_username
         password = form_password
     elif not username or not password:
-        raise HTTPException(status_code=400, detail="Missing username/password", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(status_code=400, detail="請提供 username 和 password",
+                             headers={"WWW-Authenticate": "Bearer"})
 
-    user = USERS_DB.get(username)
-    if not user or not user["is_active"]:
-        raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Bearer"})
-    pw_hash = hash_password(password, user["password_salt"])
-    if pw_hash != user["password_hash"]:
-        raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Bearer"})
-    access_token = create_access_token({"sub": user["username"], "role": user["role"], "store_id": user["store_id"]})
-    return {"access_token": access_token, "token_type": "bearer", "role": user["role"], "store_id": user["store_id"]}
+    try:
+        user = auth.authenticate(username, password)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="資料庫尚未就緒：" + str(e))
 
-@app.get("/products", response_model=List[ProductItem])
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials",
+                             headers={"WWW-Authenticate": "Bearer"})
+
+    access_token = auth.encode_token({
+        "sub": user["username"], "role": user["role"], "store_id": user["store_id"]
+    })
+    return {
+        "access_token": access_token, "token_type": "bearer",
+        "role": user["role"], "store_id": user["store_id"]
+    }
+
+
+@app.get("/products", response_model=List[ProductItem], summary="取得所有商品資料")
 async def get_products():
-    return PRODUCTS_DB
+    try:
+        with db_engine.get_conn() as conn:
+            rows = conn.execute(
+                _sql_text(
+                    "SELECT sku_no, name, continent, country, process, variety, flavor, rating "
+                    "FROM products ORDER BY sku_no ASC"
+                )
+            ).mappings().all()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="無法讀取商品主檔：" + str(e))
 
-@app.get("/inventory", response_model=List[InventoryItem])
+
+@app.get("/inventory", response_model=List[InventoryItem], summary="取得即時庫存彙總")
 async def get_inventory(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    result = []
-    for sku_no, item in INVENTORY_DB.items():
-        result.append({
-            "sku_no": sku_no,
-            "name": item["name"],
-            "total_qty_g": item["total_qty_g"],
-            "batch_count": len(item["batches"])
-        })
-    return result
+    try:
+        positions = fifo.get_all_inventory_positions(store_id=store_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="庫存查詢失敗：" + str(e))
+    return [
+        {
+            "sku_no": p.sku_no, "name": p.name,
+            "total_qty_g": p.total_qty_g, "batch_count": p.batch_count
+        }
+        for p in positions
+    ]
 
-@app.get("/inventory/batches", response_model=List[BatchItem])
+
+@app.get("/inventory/batches", summary="取得所有批次明細")
 async def get_batches(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        rows = fifo.get_all_batches(store_id=store_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="批次查詢失敗：" + str(e))
     result = []
-    for sku_no, item in INVENTORY_DB.items():
-        for batch in item["batches"]:
-            original = batch.get("original_qty_g", batch["qty_g"])
-            remaining = batch["qty_g"]
-            issued = original - remaining
-            result.append({
-                "sku_no": sku_no,
-                "batch_id": batch["batch_id"],
-                "receive_date": batch["receive_date"],
-                "original_qty_g": original,
-                "remaining_qty_g": remaining,
-                "issued_qty_g": issued,
-                "cost_per_100g": batch["cost_per_100g"],
-                "supplier": batch.get("supplier", ""),
-                "origin": batch.get("origin", ""),
-                "flavor": batch.get("flavor", ""),
-                "process": batch.get("process", "")
-            })
+    for r in rows:
+        issued = r["qty_received_g"] - r["qty_remaining_g"]
+        result.append({
+            "sku_no": r["sku_no"], "name": r["name"], "batch_id": r["batch_id"],
+            "receive_date": r["receive_date"],
+            "received_qty_g": r["qty_received_g"],
+            "issued_qty_g": issued,
+            "remaining_qty_g": r["qty_remaining_g"],
+            "cost_per_100g": r["unit_cost_ntd_per_g"] * 100,
+            "supplier": r["supplier"] or ""
+        })
     return result
 
-@app.post("/transactions/receive", response_model=SuccessResponse)
+
+@app.post("/transactions/receive", response_model=SuccessResponse, summary="進貨登錄")
 async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(get_current_user)):
     try:
-        if req.sku_no not in INVENTORY_DB:
-            raise HTTPException(status_code=400, detail="Invalid SKU")
-        receive_date = datetime.utcnow().strftime("%Y-%m-%d")
-        batch_id = len(INVENTORY_DB[req.sku_no]["batches"]) + 1
-        new_batch = {
-            "batch_id": batch_id,
-            "receive_date": receive_date,
-            "original_qty_g": req.qty_g,
-            "qty_g": req.qty_g,
-            "cost_per_100g": req.cost_per_100g,
-            "supplier": req.supplier,
-            "origin": req.origin,
-            "flavor": req.flavor,
-            "process": req.process
-        }
-        INVENTORY_DB[req.sku_no]["batches"].append(new_batch)
-        INVENTORY_DB[req.sku_no]["total_qty_g"] += req.qty_g
-
-        TRANSACTIONS_DB.append({
-            "txn_id": len(TRANSACTIONS_DB) + 1,
-            "sku_no": req.sku_no,
-            "txn_type": "IN",
-            "txn_date": receive_date,
-            "qty_g": req.qty_g,
-            "unit_price_ntd_per_g": req.cost_per_100g / 100,
-            "total_amount_ntd": req.qty_g * req.cost_per_100g / 100,
-            "channel": "進貨",
-            "timestamp": datetime.utcnow().isoformat()
-        })
-
-        return {"status": "success", "message": "Received " + str(req.qty_g) + "g", "new_total_qty_g": INVENTORY_DB[req.sku_no]["total_qty_g"]}
-    except HTTPException:
-        raise
+        fifo.receive_stock(
+            sku_no=req.sku_no,
+            qty_g=req.qty_g,
+            unit_cost_ntd_per_g=req.cost_per_100g / 100,
+            supplier=req.supplier,
+            lot_ref=req.origin or None,
+            store_id=current_user["store_id"],
+            created_by=current_user.get("user_id")
+        )
+        position = fifo.get_inventory_position(req.sku_no, store_id=current_user["store_id"])
+        new_total = position.total_qty_g if position else req.qty_g
+        return {"status": "success", "message": "進貨成功：" + str(req.qty_g) + "g",
+                "new_total_qty_g": new_total}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/transactions/issue", response_model=SuccessResponse)
+
+@app.post("/transactions/issue", response_model=SuccessResponse, summary="出貨登錄")
 async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_current_user)):
     try:
-        issue_date = datetime.utcnow().strftime("%Y-%m-%d")
-        item = INVENTORY_DB.get(req.sku_no)
-        if not item:
-            raise HTTPException(status_code=400, detail="Invalid SKU")
-        if item["total_qty_g"] < req.qty_g:
-            raise HTTPException(status_code=400, detail="Insufficient stock: have " + str(item["total_qty_g"]) + "g, need " + str(req.qty_g) + "g")
-
-        remaining = req.qty_g
-        batches_used = []
-
-        for batch in item["batches"]:
-            if remaining <= 0:
-                break
-            take = min(batch["qty_g"], remaining)
-            batch["qty_g"] -= take
-            remaining -= take
-            batches_used.append({"batch_id": batch["batch_id"], "qty_used": take})
-
-        item["total_qty_g"] -= req.qty_g
-        total_amount = req.qty_g * req.sell_price_ntd_per_100g / 100
-
-        TRANSACTIONS_DB.append({
-            "txn_id": len(TRANSACTIONS_DB) + 1,
-            "sku_no": req.sku_no,
-            "txn_type": "OUT",
-            "txn_date": issue_date,
-            "qty_g": req.qty_g,
-            "unit_price_ntd_per_g": req.sell_price_ntd_per_100g / 100,
-            "total_amount_ntd": total_amount,
-            "channel": req.channel,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-
-        return {"status": "success", "message": "Issued " + str(req.qty_g) + "g", "batches_used": batches_used, "new_total_qty_g": item["total_qty_g"]}
-    except HTTPException:
-        raise
+        fifo.issue_stock(
+            sku_no=req.sku_no,
+            qty_g=req.qty_g,
+            sell_price_ntd_per_g=req.sell_price_ntd_per_100g / 100,
+            channel=req.channel,
+            store_id=current_user["store_id"],
+            created_by=current_user.get("user_id")
+        )
+        position = fifo.get_inventory_position(req.sku_no, store_id=current_user["store_id"])
+        new_total = position.total_qty_g if position else 0.0
+        return {"status": "success", "message": "出貨成功：" + str(req.qty_g) + "g",
+                "new_total_qty_g": new_total}
+    except fifo.InsufficientStockError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/transactions", response_model=List[TransactionItem])
-async def get_transactions(store_id: int = Query(...), start_date: Optional[str] = None, end_date: Optional[str] = None, type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+
+@app.get("/transactions", summary="查詢交易明細")
+async def list_transactions(store_id: int = Query(...), start_date: Optional[str] = None,
+                             end_date: Optional[str] = None, type: Optional[str] = None,
+                             current_user: dict = Depends(get_current_user)):
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    result = TRANSACTIONS_DB.copy()
-    if type:
-        result = [t for t in result if t["txn_type"] == type]
-    if start_date:
-        result = [t for t in result if t["txn_date"] >= start_date]
-    if end_date:
-        result = [t for t in result if t["txn_date"] <= end_date]
-    return result
+    try:
+        rows = fifo.get_transactions(store_id=store_id, start_date=start_date,
+                                      end_date=end_date, txn_type=type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="交易查詢失敗：" + str(e))
+    return rows
 
-@app.get("/reports/inventory")
+
+@app.get("/reports/inventory", summary="匯出進貨報表（依批次明細）")
 async def export_inventory_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+    """
+    進貨報表欄位：SKU, 品名, 進貨日期, 供應商, 當批次進貨價(NT$/100g),
+    進貨量(g), 出庫量(g), 剩餘庫存量(g)
+    """
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    csv_content = "SKU,Product,ReceiveDate,Supplier,BatchCost_NTD_100g,ReceivedQty_g,IssuedQty_g,RemainingQty_g\n"
-    for sku_no, item in INVENTORY_DB.items():
-        for batch in item["batches"]:
-            original = batch.get("original_qty_g", batch["qty_g"])
-            remaining = batch["qty_g"]
-            issued = original - remaining
-            csv_content += str(sku_no) + "," + item["name"] + "," + batch["receive_date"] + "," + str(batch.get("supplier", "")) + "," + str(batch["cost_per_100g"]) + "," + str(original) + "," + str(issued) + "," + str(remaining) + "\n"
-    return PlainTextResponse(content=csv_content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=inventory_report.csv"})
+    try:
+        rows = fifo.get_all_batches(store_id=store_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="報表產生失敗：" + str(e))
+    csv_content = "SKU,品名,進貨日期,供應商,當批次進貨價(NT$/100g),進貨量(g),出庫量(g),剩餘庫存量(g)\n"
+    for r in rows:
+        issued = r["qty_received_g"] - r["qty_remaining_g"]
+        csv_content += str(r["sku_no"]) + "," + r["name"] + "," + r["receive_date"] + "," + \
+            str(r["supplier"] or "") + "," + str(r["unit_cost_ntd_per_g"] * 100) + "," + \
+            str(r["qty_received_g"]) + "," + str(issued) + "," + str(r["qty_remaining_g"]) + "\n"
+    return PlainTextResponse(content=csv_content, media_type="text/csv",
+                              headers={"Content-Disposition": "attachment; filename=inventory_report.csv"})
 
-@app.get("/reports/transactions")
+
+@app.get("/reports/transactions", summary="匯出出貨報表（僅 OUT 類型交易）")
 async def export_transactions_report(store_id: int = Query(...), current_user: dict = Depends(get_current_user)):
+    """
+    出貨報表欄位：日期, SKU, 數量(g), 單價(NT$/g), 總額, 通路（僅顯示 OUT 出貨交易）
+    """
     if current_user["store_id"] != store_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    csv_content = "Date,SKU,Qty_g,UnitPrice_NTD_g,TotalAmount,Channel\n"
-    for t in TRANSACTIONS_DB:
-        if t["txn_type"] != "OUT":
-            continue
-        csv_content += str(t["txn_date"]) + "," + str(t["sku_no"]) + "," + str(t["qty_g"]) + "," + str(t["unit_price_ntd_per_g"]) + "," + str(t["total_amount_ntd"]) + "," + str(t["channel"]) + "\n"
-    return PlainTextResponse(content=csv_content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=transactions_report.csv"})
+    try:
+        rows = fifo.get_transactions(store_id=store_id, txn_type="OUT")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="報表產生失敗：" + str(e))
+    csv_content = "日期,SKU,數量(g),單價(NT$/g),總額,通路\n"
+    for t in rows:
+        csv_content += str(t["txn_date"]) + "," + str(t["sku_no"]) + "," + str(t["qty_g"]) + "," + \
+            str(t["unit_price_ntd_per_g"]) + "," + str(t["total_amount_ntd"]) + "," + \
+            str(t["channel"] or "") + "\n"
+    return PlainTextResponse(content=csv_content, media_type="text/csv",
+                              headers={"Content-Disposition": "attachment; filename=transactions_report.csv"})
+
 
 if __name__ == "__main__":
     import uvicorn
