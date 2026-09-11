@@ -1,16 +1,22 @@
 """
-api_server.py -- A.O.M Cafe 進銷存 API v8
+api_server.py -- A.O.M Cafe 進銷存 API v9
 ------------------------------------------------------------------------
-本版本基於 v7（真實資料庫串接版），新增角色權限限制：
-- admin（管理者）：可進貨、可出貨、可查看完整報表
-- staff（店員）：僅可執行出貨，進貨端點回傳 403 Forbidden
+本版本基於 v8（角色權限限制版），新增啟動時自動執行資料庫遷移：
+- migrate_add_unique_natural_key.migrate()：為 products 表的
+  (continent, country, name) 組合建立唯一索引，防止未來因命名疏失
+  產生重複商品，確保 seed_135sku.py 的自然鍵比對邏輯永遠準確無歧義。
 
-其餘架構與 v7 相同：
-1. 進貨/出貨/庫存查詢皆呼叫 fifo_engine_v2.py 的 FIFO 引擎，寫入真實資料庫
-2. 登入機制使用 auth.py 的 PBKDF2 + 自製 JWT（HS256）
-3. 啟動時呼叫 seed_135sku.seed() 寫入 135 筆商品主檔，並確保帳號存在
-   （admin / aom_founder：管理者；aom_staff：店員）
-4. 若資料庫初始化失敗，服務仍會啟動，但需修正後才能使用資料庫相關端點
+啟動流程順序（重要，不可調換）：
+1. db_engine.init_db()              -- 建立資料表
+2. seed_135sku.seed()               -- 寫入/更新135筆商品主檔（自然鍵比對）
+3. migrate_add_unique_natural_key.migrate()  -- 確認無重複後建立唯一索引
+4. auth.seed_known_accounts()       -- 確保 admin/aom_founder/aom_staff 帳號存在
+
+其餘架構與 v8 相同：
+- admin（管理者）：可進貨、可出貨、可查看完整報表
+- staff（店員）：僅可執行出貨，進貨與報表端點回傳 403 Forbidden
+- 進貨/出貨/庫存查詢皆呼叫 fifo_engine_v2.py 的 FIFO 引擎，寫入真實資料庫
+- 登入機制使用 auth.py 的 PBKDF2 + 自製 JWT（HS256）
 """
 from contextlib import asynccontextmanager
 import logging
@@ -29,6 +35,7 @@ import db_engine
 import auth
 import fifo_engine_v2 as fifo
 import seed_135sku
+import migrate_add_unique_natural_key
 from sqlalchemy import text as _sql_text
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -39,8 +46,10 @@ async def lifespan(app: FastAPI):
     try:
         db_engine.init_db()
         seed_135sku.seed()
+        migrate_add_unique_natural_key.migrate()
         auth.seed_known_accounts()
-        logger.info("Startup: database initialized, 135 SKU seeded, accounts ensured.")
+        logger.info("Startup: database initialized, 135 SKU seeded, "
+                    "unique natural-key index ensured, accounts ensured.")
     except Exception as e:
         logger.warning("Startup: database initialization failed (%s). "
                         "The service is still running, but /inventory, /transactions, "
@@ -50,7 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="A.O.M Cafe 進銷存 API",
-    version="8.0.0",
+    version="9.0.0",
     docs_url="/docs",
     openapi_url="/openapi.json",
     redoc_url="/redoc",
@@ -141,7 +150,7 @@ def require_admin(current_user: dict = Depends(get_current_user)):
 
 @app.get("/")
 async def root():
-    return {"message": "A.O.M Cafe 進銷存 API v8.0.0", "status": "online"}
+    return {"message": "A.O.M Cafe 進銷存 API v9.0.0", "status": "online"}
 
 
 @app.get("/health")
