@@ -47,7 +47,7 @@ def migrate():
         """)
         conn.execute(
             "INSERT INTO stores (store_id, store_name, address, is_active) VALUES (1, ?, ?, 1)",
-            ("A.O.M Cafe 台中旗艦店（首店）", "台中市（既有資料自動歸屬本店）")
+            ("A.O.M Café 台中旗艦店（首店）", "台中市（既有資料自動歸屬本店）")
         )
         print("已建立 stores 表，並將既有資料歸屬於 store_id=1")
     else:
