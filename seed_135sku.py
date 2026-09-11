@@ -1,15 +1,18 @@
 """
-seed_135sku.py -- A.O.M Cafe Coffee Bean Master SKU Seed Data (Updated v2)
+seed_135sku.py -- A.O.M Cafe Coffee Bean Master SKU Seed Data (Updated v3)
 
-Update summary:
-1. Added 20 NEW Guatemala farms from 2026 farm directory PDF
-   (2026_Guatemala_Coffee_Bean_Card_Numbered), covering Huehuetenango,
-   Atitlan/Solola, Sacatepequez, Jutiapa, Baja Verapaz, Zacapa, Quetzaltenango.
-2. Combined with prior 115 SKU (100 original + 15 from 2024 quote sheet).
-3. Total 135 SKU, re-sorted by import region (continent: Africa ->
-   Central/South America -> Asia -> Taiwan, then grouped by country)
-   and renumbered sequentially 1-135.
-4. All 40 Guatemala SKUs are now grouped together at SKU 46-85.
+修正紀錄：
+- v3：seed() 改為「存在則更新、不存在則新增」的安全 UPSERT 寫法，
+  取代先前「先刪除、再新增」的做法。
+  原因：一旦 batches 表已有真實進貨紀錄參照某個 sku_no，
+  DELETE 該筆商品會違反外鍵限制（ForeignKeyViolation），
+  導致服務啟動失敗。此修正確保重新部署/重新啟動時，
+  即使資料庫已有交易資料也能安全地重新整理商品主檔。
+
+資料內容摘要：
+1. 100 原始 SKU + 15 筆（2024報價單）+ 20 筆（2026莊園名錄）＝ 135 筆
+2. 已依進口地域重新排序：非洲 -> 中南美洲 -> 亞洲 -> 台灣，並依國家分組
+3. 全部 40 筆瓜地馬拉 SKU 集中於 SKU 46-85
 """
 from sqlalchemy import text
 from db_engine import get_conn, init_db
@@ -162,20 +165,33 @@ VALUES (:sku_no, :continent, :country, :name, :process, :variety, :flavor, :rati
 :notes, :season, :importer, :shelf_life_months, :is_active)
 """)
 
-DELETE_SQL = text("DELETE FROM products WHERE sku_no = :sku_no")
+UPDATE_SQL = text("""
+UPDATE products SET
+continent = :continent, country = :country, name = :name, process = :process,
+variety = :variety, flavor = :flavor, rating = :rating, strategy = :strategy,
+batch_hint = :batch_hint, cost_range_raw = :cost_range_raw,
+cost_ntd_100g_raw = :cost_ntd_100g_raw, retail_ntd_100g_raw = :retail_ntd_100g_raw,
+margin_pct_raw = :margin_pct_raw, notes = :notes, season = :season,
+importer = :importer, shelf_life_months = :shelf_life_months, is_active = :is_active
+WHERE sku_no = :sku_no
+""")
+
+EXISTS_SQL = text("SELECT COUNT(*) FROM products WHERE sku_no = :sku_no")
 
 COLUMNS = ['sku_no', 'continent', 'country', 'name', 'process', 'variety', 'flavor', 'rating', 'strategy', 'batch_hint', 'cost_range_raw', 'cost_ntd_100g_raw', 'retail_ntd_100g_raw', 'margin_pct_raw', 'notes', 'season', 'importer', 'shelf_life_months', 'is_active']
 
 def seed():
-    """Import 135 SKU master records to database (delete-then-insert upsert,
-    compatible with both SQLite and PostgreSQL dialects)."""
+    """匯入135筆SKU商品主檔（存在則更新、不存在則新增，安全相容於已有交易資料的資料庫）"""
     init_db()
     with get_conn() as conn:
         for row in PRODUCTS:
             params = dict(zip(COLUMNS, row))
-            conn.execute(DELETE_SQL, {"sku_no": params["sku_no"]})
-            conn.execute(INSERT_SQL, params)
-    print("Imported " + str(len(PRODUCTS)) + " SKU records to database")
+            exists = conn.execute(EXISTS_SQL, {"sku_no": params["sku_no"]}).scalar()
+            if exists:
+                conn.execute(UPDATE_SQL, params)
+            else:
+                conn.execute(INSERT_SQL, params)
+    print("Imported/updated " + str(len(PRODUCTS)) + " SKU records in database")
 
 if __name__ == "__main__":
     seed()
