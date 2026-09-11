@@ -5,6 +5,11 @@ fifo_engine_v2.py -- 商業邏輯層 v2：支援多門店(store_id)的 FIFO 進�
 1. 進貨（receive_stock）：建立新批次，寫入 IN 交易紀錄
 2. 出貨（issue_stock）：依 receive_date 由舊到新扣帳，寫入 OUT 交易紀錄與分攤明細
 3. 所有函式皆支援 store_id，同店庫存互相獨立，不同店互不影響
+
+修正紀錄：
+- v2.1：改用 RETURNING 語法取得新建立的 batch_id / txn_id，
+  修正 PostgreSQL 下 result.lastrowid 回傳 0 導致外鍵違反的問題
+  （SQLite 3.35+ 與 PostgreSQL 皆支援 RETURNING 語法）
 """
 
 import datetime as _dt
@@ -35,14 +40,15 @@ def receive_stock(sku_no: int, qty_g: float, unit_cost_ntd_per_g: float,
                 "INSERT INTO batches "
                 "(sku_no, store_id, receive_date, qty_received_g, qty_remaining_g, "
                 "unit_cost_ntd_per_g, supplier, lot_ref, created_by) "
-                "VALUES (:sku, :store, :rdate, :qty, :qty, :cost, :sup, :lot, :uid)"
+                "VALUES (:sku, :store, :rdate, :qty, :qty, :cost, :sup, :lot, :uid) "
+                "RETURNING batch_id"
             ),
             {
                 "sku": sku_no, "store": store_id, "rdate": receive_date, "qty": qty_g,
                 "cost": unit_cost_ntd_per_g, "sup": supplier, "lot": lot_ref, "uid": created_by
             }
         )
-        batch_id = result.lastrowid if hasattr(result, "lastrowid") else result.inserted_primary_key[0]
+        batch_id = result.scalar()
         total_amount = qty_g * unit_cost_ntd_per_g
         ref_text = lot_ref or ("批次#" + str(batch_id))
         conn.execute(
@@ -121,7 +127,8 @@ def issue_stock(sku_no: int, qty_g: float, sell_price_ntd_per_g: float,
                 "(sku_no, store_id, txn_type, txn_date, qty_g, unit_price_ntd_per_g, "
                 "total_amount_ntd, total_cogs_ntd, gross_profit_ntd, channel, reference, created_by) "
                 "VALUES (:sku, :store, 'OUT', :tdate, :qty, :price, :amt, :cogs, :profit, "
-                ":channel, :ref, :uid)"
+                ":channel, :ref, :uid) "
+                "RETURNING txn_id"
             ),
             {
                 "sku": sku_no, "store": store_id, "tdate": issue_date, "qty": qty_g,
@@ -129,7 +136,7 @@ def issue_stock(sku_no: int, qty_g: float, sell_price_ntd_per_g: float,
                 "profit": gross_profit, "channel": channel, "ref": reference, "uid": created_by
             }
         )
-        txn_id = result.lastrowid if hasattr(result, "lastrowid") else result.inserted_primary_key[0]
+        txn_id = result.scalar()
 
         for a in allocations:
             conn.execute(
