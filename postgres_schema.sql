@@ -95,5 +95,5 @@ CREATE INDEX IF NOT EXISTS idx_txn_sku_store ON transactions(sku_no, store_id, t
 CREATE INDEX IF NOT EXISTS idx_txn_store_date ON transactions(store_id, txn_date);
 
 INSERT INTO stores (store_id, store_name, address, is_active)
-VALUES (1, 'A.O.M Cafe 台中旗艦店', '台中市', 1)
+VALUES (1, 'A.O.M Café 台中旗艦店', '台中市', 1)
 ON CONFLICT (store_id) DO NOTHING;
