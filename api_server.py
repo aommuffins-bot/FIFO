@@ -1,5 +1,5 @@
 """
-api_server.py -- A.O.M Cafe 進銷存 API v9
+api_server.py -- A.O.M Café FIFO API v9
 ------------------------------------------------------------------------
 本版本基於 v8（角色權限限制版），新增啟動時自動執行資料庫遷移：
 - migrate_add_unique_natural_key.migrate()：為 products 表的
@@ -13,7 +13,7 @@ api_server.py -- A.O.M Cafe 進銷存 API v9
 4. auth.seed_known_accounts()       -- 確保 admin/aom_founder/aom_staff 帳號存在
 
 其餘架構與 v8 相同：
-- admin（管理者）：可進貨、可出貨、可查看完整報表
+- aom_founder, admin（管理者）：可進貨、可出貨、可查看完整報表
 - staff（店員）：僅可執行出貨，進貨與報表端點回傳 403 Forbidden
 - 進貨/出貨/庫存查詢皆呼叫 fifo_engine_v2.py 的 FIFO 引擎，寫入真實資料庫
 - 登入機制使用 auth.py 的 PBKDF2 + 自製 JWT（HS256）
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="A.O.M Café 進銷存 API",
+    title="A.O.M Café FIFO API",
     version="9.0.0",
     docs_url="/docs",
     openapi_url="/openapi.json",
