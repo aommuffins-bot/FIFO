@@ -149,7 +149,7 @@ def init_db():
         if not exists:
             conn.execute(
                 stores.insert().values(
-                    store_id=1, store_name="A.O.M Cafe 旗艦店",
+                    store_id=1, store_name="A.O.M Café 旗艦店",
                     address="示範門店資料", is_active=1
                 )
             )
