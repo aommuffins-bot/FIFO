@@ -1,5 +1,5 @@
 """
-seed_135sku.py -- A.O.M Cafe Coffee Bean Master SKU Seed Data (v5)
+seed_135sku.py -- A.O.M Café Coffee Bean Master SKU Seed Data (v5)
 
 ★ 架構升級：改用「自然鍵」比對邏輯，確保既有 SKU 編號永久不變 ★
 
