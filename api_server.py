@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="A.O.M Cafe 進銷存 API",
+    title="A.O.M Café 進銷存 API",
     version="9.0.0",
     docs_url="/docs",
     openapi_url="/openapi.json",
@@ -150,7 +150,7 @@ def require_admin(current_user: dict = Depends(get_current_user)):
 
 @app.get("/")
 async def root():
-    return {"message": "A.O.M Cafe 進銷存 API v9.0.0", "status": "online"}
+    return {"message": "A.O.M Café 進銷存 API v9.0.0", "status": "online"}
 
 
 @app.get("/health")
@@ -303,7 +303,7 @@ async def list_transactions(store_id: int = Query(...), start_date: Optional[str
     return rows
 
 
-@app.get("/reports/inventory", summary="匯出進貨報表（限管理者 admin）")
+@app.get("/reports/inventory", summary="匯出進貨報表（限管理者 aom_founder, admin）")
 async def export_inventory_report(store_id: int = Query(...), current_user: dict = Depends(require_admin)):
     """
     進貨報表欄位：SKU, 品名, 進貨日期, 供應商, 當批次進貨價(NT$/100g),
@@ -326,7 +326,7 @@ async def export_inventory_report(store_id: int = Query(...), current_user: dict
                               headers={"Content-Disposition": "attachment; filename=inventory_report.csv"})
 
 
-@app.get("/reports/transactions", summary="匯出出貨報表（限管理者 admin，僅 OUT 類型交易）")
+@app.get("/reports/transactions", summary="匯出出貨報表（限管理者 aom_founder, admin，僅 OUT 類型交易）")
 async def export_transactions_report(store_id: int = Query(...), current_user: dict = Depends(require_admin)):
     """
     出貨報表欄位：日期, SKU, 數量(g), 單價(NT$/g), 總額, 通路（僅顯示 OUT 出貨交易）
