@@ -150,7 +150,7 @@ def require_admin(current_user: dict = Depends(get_current_user)):
 
 @app.get("/")
 async def root():
-    return {"message": "A.O.M Café 進銷存 API v9.0.0", "status": "online"}
+    return {"message": "A.O.M Café FIFO API v9.0.0", "status": "online"}
 
 
 @app.get("/health")
@@ -246,7 +246,7 @@ async def get_batches(store_id: int = Query(...), current_user: dict = Depends(g
     return result
 
 
-@app.post("/transactions/receive", response_model=SuccessResponse, summary="進貨登錄（限管理者 admin）")
+@app.post("/transactions/receive", response_model=SuccessResponse, summary="進貨登錄（限管理者 aom_founder, admin）")
 async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(require_admin)):
     try:
         fifo.receive_stock(
@@ -268,7 +268,7 @@ async def receive_stock(req: ReceiveRequest, current_user: dict = Depends(requir
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/transactions/issue", response_model=SuccessResponse, summary="出貨登錄（admin/staff皆可）")
+@app.post("/transactions/issue", response_model=SuccessResponse, summary="出貨登錄（aom_founder, admin/staff皆可）")
 async def issue_stock(req: IssueRequest, current_user: dict = Depends(get_current_user)):
     try:
         fifo.issue_stock(
